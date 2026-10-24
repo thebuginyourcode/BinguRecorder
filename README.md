@@ -196,6 +196,10 @@ can download the result from the run's **Artifacts**.
 `tests/run_tests.sh` compiles the AVI writer and JPEG encoder for your PC and
 checks their output with ffmpeg (needs `g++` and `ffmpeg`).
 
+`tests/emulator/` runs the actual plugin in the Azahar emulator with a test
+game. It records 20 seconds and checks the frame timing and audio/video
+sync (see `tests/emulator/README.md`).
+
 ## How it works
 
 - `plugin/Sources/Recorder.cpp` uses the CTRPF OSD hook, which runs every time

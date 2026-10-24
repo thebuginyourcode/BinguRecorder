@@ -99,7 +99,7 @@ static void     DrawList(const std::vector<VideoFile> &files, u32 selected, cons
                     + label.substr(26, 2) + label.substr(28, label.size() - 32);
             }
 
-            printf("\x1b[%lu;1H%s %-30.30s %5.1f MB\x1b[0m", 3 + (i - first),
+            printf("\x1b[%lu;1H%s %-28.28s %5.1f MB\x1b[0m", 3 + (i - first),
                 i == selected ? "\x1b[47;30m>" : " ", label.c_str(), f.size / 1048576.0);
         }
     }
