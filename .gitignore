@@ -1,0 +1,4 @@
+plugin/release/
+plugin/debug/
+plugin/*.elf
+plugin/*.3gx

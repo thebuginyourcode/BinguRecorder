@@ -1,0 +1,25 @@
+Author: BinguRecorder
+
+Version: # Plugin version
+    Major: 1
+    Minor: 0
+    Revision: 0
+
+Targets: # Low TitleId of games which are compatible with this plugin (empty for all)
+
+Title: BinguRecorder
+
+Summary: Screen recorder
+
+Description: |
+  Records the game screen to the SD card as an .avi video.
+
+  Open the plugin menu with Select, or press L + R + Down
+  in game to start and stop recording.
+  Videos are saved in sd:/BinguRecorder/
+
+Compatibility: Any
+
+MemorySize: 5MiB
+
+UsePrivateMemory: false
