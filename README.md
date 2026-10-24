@@ -53,6 +53,26 @@ Settings.
 Time spent in the plugin menu is cut from the video. If the game closes, you
 press HOME, or you close the lid, the recording is stopped and saved first.
 
+## Quick setup
+
+Menu → **Quick setup** picks a size, frame rate and priority in one step:
+
+| Preset | Size | Frame rate | Good for |
+| --- | --- | --- | --- |
+| Sharp | Full (400×240) | 10 fps | RPGs, menus, slow games |
+| Balanced | Full | 15 fps | most games |
+| **Smooth** | Half (200×120) | 30 fps | action games, let's plays |
+| Smoothest | Half | 30 fps, Priority: Recording | heavy games where Smooth skips frames |
+
+10 fps looks choppy on YouTube for anything fast-moving. For let's plays,
+**Smooth** is usually the best choice. Upload it scaled up with sharp pixels
+(see "The video files" below). Smoothest makes the encoder go ahead of the
+game, so the game can slow down while you record. Only use it if the `.txt`
+report for a Smooth recording shows skipped frames.
+
+In the emulator test, every preset recorded its full frame rate with no
+skipped frames, and the sound was within about 10 ms of the picture.
+
 ## Settings (Menu → Settings)
 
 | Setting | Options | Default |
@@ -62,7 +82,7 @@ press HOME, or you close the lid, the recording is stopped and saved first.
 | Quality | Low, Medium, High, Max | Medium |
 | Priority | Game (full speed) / Recording (smoother video) | Game |
 | Screen | Top, Bottom, Both (top above bottom) | Top |
-| Frame rate | 5, 10, 15, 20, 30 screenshots per second | 10 |
+| Frame rate | 5, 10, 15, 20, 24, 30 screenshots per second | 10 |
 | Size | Full (400×240) or Half (200×120) | Full |
 | REC indicator | On / Off | On |
 
@@ -121,9 +141,10 @@ A few things to know:
 
 The Old 3DS CPU is slow. These settings are a starting point:
 
-- **Top, Full, 10 fps.** This is the default.
-- **Top, Half, 20–30 fps.** Smoother motion, lower resolution. Compressing a
-  frame is about 4× less work.
+- **Top, Full, 10–15 fps.** Compressing a full-size frame took about 50 ms
+  in the emulator test, so about 20 fps is the most full size can reach.
+- **Top, Half, 30 fps.** Smoother motion, lower resolution. A half-size frame
+  took about 11 ms.
 - **Both, Full, 5 fps** or **Both, Half, 10–15 fps.**
 
 Games that already use all of the CPU leave less time for compression, and

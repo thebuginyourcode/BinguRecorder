@@ -2,7 +2,9 @@
 //
 // Top screen: moving gradient, a white square sliding across, the frame
 // number as 16 black/white blocks (so a recording can be checked frame by
-// frame) and a corner that flashes white for 3 frames every second.
+// frame), a second row with the time since start in 10 ms steps (so sound
+// and picture can be compared even when the frame rate changes) and a
+// corner that flashes white for 3 frames every second.
 // Bottom screen: a different moving pattern with the same frame number.
 // Sound: a quiet 330 Hz tone, plus a loud 1 kHz beep for 0.1 s every second,
 // at the same moment as the flash.
@@ -40,18 +42,23 @@ static void Rect(u8 *fb, int x0, int y0, int w, int h, u8 r, u8 g, u8 b)
             Put(fb, x, y, r, g, b);
 }
 
-// 16 blocks of 20x20 at the top: white = 1, black = 0, bit 0 on the left
-static void DrawCounter(u8 *fb, u32 n)
+// 16 blocks of 20x20: white = 1, black = 0, bit 0 on the left
+static void DrawBits(u8 *fb, int y, u32 n)
 {
-    Rect(fb, 0, 0, 16 * 24 + 4, 28, 255, 0, 255);
+    Rect(fb, 0, y, 16 * 24 + 4, 28, 255, 0, 255);
     for (int i = 0; i < 16; ++i)
     {
         u8 v = (n >> i) & 1 ? 255 : 0;
-        Rect(fb, 4 + i * 24, 4, 20, 20, v, v, v);
+        Rect(fb, 4 + i * 24, y + 4, 20, 20, v, v, v);
     }
 }
 
-static void DrawTop(u8 *fb, u32 n, bool flash)
+static void DrawCounter(u8 *fb, u32 n)
+{
+    DrawBits(fb, 0, n);
+}
+
+static void DrawTop(u8 *fb, u32 n, u32 centiseconds, bool flash)
 {
     for (int x = 0; x < TOP_W; ++x)
     {
@@ -60,6 +67,7 @@ static void DrawTop(u8 *fb, u32 n, bool flash)
             Put(fb, x, y, r, (u8)(g + y / 2), b);
     }
     DrawCounter(fb, n);
+    DrawBits(fb, 28, centiseconds);
     Rect(fb, (n * 4) % (TOP_W - 40), 100, 40, 40, 255, 255, 255);
     Rect(fb, 0, H - 40, 40, 40, flash ? 255 : 0, flash ? 255 : 0, flash ? 255 : 0);
 }
@@ -151,7 +159,7 @@ int main(void)
         bool flash = seconds - (u32)seconds < 3.0 / 60;
 
         bank ^= 1;
-        DrawTop(top[bank], n, flash);
+        DrawTop(top[bank], n, (u32)(seconds * 100), flash);
         DrawBottom(bottom[bank], n);
         GSPGPU_FlushDataCache(top[bank], TOP_W * H * 3);
         GSPGPU_FlushDataCache(bottom[bank], BOTTOM_W * H * 3);

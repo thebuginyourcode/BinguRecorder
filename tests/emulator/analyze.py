@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Checks a BinguRecorder recording of the emulator test app (testapp/).
 
-The test app draws its frame number as 16 black/white blocks and beeps at
-every whole second of its sound clock. From the recording this reads which
-game frame each video frame shows, and how far each beep is from the moment
-the matching game frame is on screen (audio/video sync).
+The test app draws its frame number and its clock (10 ms steps) as rows of
+16 black/white blocks, and beeps at every whole second of its sound clock.
+From the recording this reads which game frame each video frame shows, and
+how far each beep is from the moment the app's clock shows that second on
+screen (audio/video sync, independent of the game's frame rate).
 
 usage: analyze.py <recording.avi>     (needs ffmpeg)
 """
@@ -13,7 +14,7 @@ import subprocess
 import sys
 import tempfile
 
-W, H, RATE = 400, 240, 32728
+RATE = 32728
 
 
 def run(*args):
@@ -21,6 +22,14 @@ def run(*args):
 
 
 def main(path):
+    probe = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries',
+                            'stream=width,height,r_frame_rate', '-of', 'csv=p=0', path],
+                           check=True, capture_output=True, text=True).stdout.strip().split(',')
+    W, H = int(probe[0]), int(probe[1])
+    num, den = probe[2].split('/')
+    fps = int(num) / int(den)
+    scale = 400 / W     # 2 for half-size recordings
+
     with tempfile.TemporaryDirectory() as tmp:
         run('ffmpeg', '-i', path, '-f', 'rawvideo', '-pix_fmt', 'rgb24', tmp + '/v.rgb')
         run('ffmpeg', '-i', path, '-map', '0:a', '-ac', '1', '-f', 's16le', tmp + '/a.pcm')
@@ -29,19 +38,25 @@ def main(path):
 
     frames = len(video) // (W * H * 3)
 
-    def counter(f):
+    def bits(f, row_y):
         value = 0
         for bit in range(16):
-            o = (f * W * H + 14 * W + 4 + bit * 24 + 10) * 3
+            x, y = int((4 + bit * 24 + 10) / scale), int(row_y / scale)
+            o = (f * W * H + y * W + x) * 3
             if sum(video[o:o + 3]) / 3 > 128:
                 value |= 1 << bit
         return value
 
-    c = [counter(f) for f in range(frames)]
-    steps = [b - a for a, b in zip(c, c[1:])]
-    game_fps = (c[-1] - c[0]) / ((frames - 1) / 10)
-    print('video: %d frames (%.1f s), game frame rate %.2f fps' % (frames, frames / 10, game_fps))
-    print('game frames between video frames: min %d, max %d, average %.2f' % (min(steps), max(steps), sum(steps) / len(steps)))
+    c = [bits(f, 14) for f in range(frames)]          # game frame number
+    clock = [bits(f, 42) / 100 for f in range(frames)]  # app time, seconds
+    steps = [b - a for a, b in zip(c, c[1:]) if b != a]
+    game_fps = (c[-1] - c[0]) / ((frames - 1) / fps)
+    real = sum(1 for a, b in zip(c, c[1:]) if b != a) + 1
+    print('video: %dx%d, %d frames at %g fps (%.1f s), game frame rate %.2f fps'
+          % (W, H, frames, fps, frames / fps, game_fps))
+    print('different pictures: %d (%.1f per second)' % (real, real / (frames / fps)))
+    print('game frames between different pictures: min %d, max %d, average %.2f'
+          % (min(steps), max(steps), sum(steps) / len(steps)))
 
     samples = struct.unpack('<%dh' % (len(audio) // 2), audio)
     win, beeps, loud_before = 164, [], False
@@ -51,16 +66,19 @@ def main(path):
             beeps.append(i / RATE)
         loud_before = loud
 
+    # Video time at which the app's on-screen clock reaches `app_seconds`.
+    # A picture stays up until the next one, so this is accurate to one
+    # video frame plus the app's own 10 ms clock steps.
     def video_time(app_seconds):
-        g = app_seconds * game_fps
         for i in range(frames - 1):
-            if c[i] <= g < c[i + 1]:
-                return i / 10 + (g - c[i]) / game_fps
+            if clock[i] <= app_seconds < clock[i + 1]:
+                span = clock[i + 1] - clock[i]
+                return (i + (app_seconds - clock[i]) / span) / fps
         return None
 
     offsets = []
     for b in beeps:
-        candidates = [video_time(k) for k in range(int(c[0] / game_fps) - 1, int(c[-1] / game_fps) + 2)]
+        candidates = [video_time(k) for k in range(int(clock[0]) - 1, int(clock[-1]) + 2)]
         candidates = [t for t in candidates if t is not None]
         if candidates:
             offsets.append(b - min(candidates, key=lambda t: abs(t - b)))

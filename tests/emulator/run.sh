@@ -18,7 +18,8 @@ g++ -std=c++17 -O2 -I"$(dirname "$AZAHAR_CORE")/../../../externals/libretro-comm
        "$here/host/retro_host.cpp" -ldl -o "$work/retro_host"
 
 sd="$work/Azahar/sdmc"
-rm -rf "$sd/BinguRecorder"
+# Keep settings.bin (lets a test pick settings), drop old recordings
+rm -f "$sd"/BinguRecorder/*.avi "$sd"/BinguRecorder/*.txt
 mkdir -p "$sd/luma/plugins" "$sd/3ds"
 # The test app is homebrew (libctru), so use a copy allowed to load into it
 python3 "$here/allow_homebrew.py" "$repo/plugin/BinguRecorder.3gx" "$sd/luma/plugins/default.3gx" >/dev/null

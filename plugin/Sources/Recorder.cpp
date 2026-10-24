@@ -931,7 +931,8 @@ namespace Bingu
 
     // Worker 0 shares the game's core: by default it only uses time the game
     // leaves free (lowest priority), with "Priority: Recording" it goes ahead
-    // of the game. Worker 1 is on the system core, where the game's main
+    // of the game, but never level with the audio thread (equal priorities
+    // don't preempt each other, and audio has to be read every ~5 ms). Worker 1 is on the system core, where the game's main
     // thread never runs, so it can always have a fairly high priority (still
     // below the game's sound threads, which run around 0x18-0x20 there).
     static s32      WorkerPriority(u32 worker, Codec codec, u8 priority)
@@ -939,7 +940,7 @@ namespace Bingu
         if (worker == 1)
             return 0x28;
         if (priority)
-            return 0x18;
+            return 0x20; // ahead of a typical game (~0x30), behind audio capture (0x18)
         // Raw frames only need writing, which mostly waits on the SD card
         return codec == Codec::Mjpeg ? 0x3F : 0x2E;
     }

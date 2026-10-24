@@ -11,7 +11,24 @@ namespace CTRPluginFramework
     using namespace Bingu;
 
     static const std::vector<std::string>   ScreenNames = { "Top screen", "Bottom screen", "Both screens" };
-    static const std::vector<u8>            FpsChoices = { 5, 10, 15, 20, 30 };
+    static const std::vector<u8>            FpsChoices = { 5, 10, 15, 20, 24, 30 };
+
+    // Ready-made combinations of size, frame rate and priority
+    struct Preset
+    {
+        const char *name;
+        u8          halfSize;
+        u8          fps;
+        u8          priority;
+    };
+
+    static const Preset     Presets[] =
+    {
+        { "Sharp: full size, 10 fps (slow games, RPGs)", 0, 10, 0 },
+        { "Balanced: full size, 15 fps", 0, 15, 0 },
+        { "Smooth: half size, 30 fps (action games)", 1, 30, 0 },
+        { "Smoothest: half, 30 fps, slows the game a bit", 1, 30, 1 },
+    };
 
     static MenuEntry   *g_screenEntry;
     static MenuEntry   *g_fpsEntry;
@@ -99,6 +116,30 @@ namespace CTRPluginFramework
         MessageBox(recording ? "Recording stopped, the video is being saved." :
             "Recording started!\nClose the menu to continue playing.\n\nPress " +
             entry->Hotkeys[0].ToString() + " to stop.")();
+    }
+
+    static void     QuickSetup(MenuEntry *)
+    {
+        if (!ChangeSetting())
+            return;
+
+        std::vector<std::string> names;
+        for (const Preset &p : Presets)
+            names.push_back(p.name);
+
+        Keyboard kb("Quick setup\n\nFull size is sharper, half size allows a\nsmoother frame rate on an Old 3DS. The\n.txt report next to each video shows the\nframe rate you really got.", names);
+        int choice = kb.Open();
+
+        if (choice >= 0)
+        {
+            const Preset &p = Presets[choice];
+            Recorder::settings.halfSize = p.halfSize;
+            Recorder::settings.fps = p.fps;
+            Recorder::settings.priority = p.priority;
+            SettingsChanged();
+            MessageBox(Utils::Format("Set to %s size, %u fps, priority %s.\nOther settings are unchanged.",
+                p.halfSize ? "half" : "full", p.fps, p.priority ? "Recording" : "Game"))();
+        }
     }
 
     static void     ChooseScreen(MenuEntry *)
@@ -257,6 +298,9 @@ namespace CTRPluginFramework
         hotkey->Hotkeys += Hotkey(Key::L | Key::R | Key::DPadDown, "Start / stop recording");
         *menu += hotkey;
         hotkey->Enable();
+
+        *menu += new MenuEntry("Quick setup (smooth or sharp)", nullptr, QuickSetup,
+            "Pick a ready-made combination of size, frame rate and priority. Everything can still be changed one by one under Settings.");
 
         MenuFolder *folder = new MenuFolder("Settings");
         g_screenEntry = new MenuEntry("", nullptr, ChooseScreen, "Record the top screen, the bottom screen, or both stacked on top of each other.");
