@@ -24,7 +24,11 @@ jobs:
         run: scripts/install-ctrpf.sh
       - name: Build plugin
         run: make -C plugin
+      - name: Build player
+        run: make -C player
       - uses: actions/upload-artifact@v4
         with:
           name: BinguRecorder
-          path: plugin/BinguRecorder.3gx
+          path: |
+            plugin/BinguRecorder.3gx
+            player/BinguPlayer.3dsx

@@ -20,6 +20,7 @@ namespace CTRPluginFramework
     static MenuEntry   *g_compressEntry;
     static MenuEntry   *g_qualityEntry;
     static MenuEntry   *g_soundEntry;
+    static MenuEntry   *g_priorityEntry;
 
     static const std::vector<std::string>   SoundNames =
     {
@@ -60,6 +61,7 @@ namespace CTRPluginFramework
         g_compressEntry->Name() = s.compress ? "Compression: On (small files)" : "Compression: Off (huge files)";
         g_qualityEntry->Name() = "Quality: " + QualityName(s.quality);
         g_soundEntry->Name() = "Sound: " + SoundNames[s.audio];
+        g_priorityEntry->Name() = s.priority ? "Priority: Recording" : "Priority: Game";
     }
 
     static bool     ChangeSetting(void)
@@ -201,6 +203,25 @@ namespace CTRPluginFramework
         }
     }
 
+    static void     ChoosePriority(MenuEntry *)
+    {
+        if (!ChangeSetting())
+            return;
+
+        Keyboard kb("What matters more while recording?",
+        {
+            "Game: full game speed, the video may be choppy",
+            "Recording: smoother video, the game may slow down",
+        });
+        int choice = kb.Open();
+
+        if (choice >= 0)
+        {
+            Recorder::settings.priority = (u8)choice;
+            SettingsChanged();
+        }
+    }
+
     static void     ToggleIndicator(MenuEntry *)
     {
         Recorder::settings.indicator ^= 1;
@@ -238,12 +259,14 @@ namespace CTRPluginFramework
         g_indicatorEntry = new MenuEntry("", nullptr, ToggleIndicator, "Shows a blinking REC timer on the screen that is NOT being recorded.");
         g_compressEntry = new MenuEntry("", nullptr, ToggleCompression, "Saves every frame as a JPEG inside the video: about 10x smaller files. Compressing only uses CPU time the game leaves free.");
         g_qualityEntry = new MenuEntry("", nullptr, ChooseQuality, "Image quality of the compressed frames.");
+        g_priorityEntry = new MenuEntry("", nullptr, ChoosePriority, "Game: compression only uses CPU time the game leaves free. Recording: compression goes first, so more frames are recorded but the game can slow down.");
         g_soundEntry = new MenuEntry("", nullptr, ChooseSound, "Records what comes out of the speakers. Small saves mono sound at half the sample rate.");
         *folder += g_soundEntry;
         *folder += g_compressEntry;
         *folder += g_qualityEntry;
         *folder += g_screenEntry;
         *folder += g_fpsEntry;
+        *folder += g_priorityEntry;
         *folder += g_sizeEntry;
         *folder += g_indicatorEntry;
         *menu += folder;

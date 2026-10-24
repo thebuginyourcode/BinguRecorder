@@ -64,6 +64,25 @@ namespace Bingu
     static u32              g_stopFrame;
     static ScreenInfo       g_bottom;
 
+    // Numbers for the .txt report saved next to each video, to see where the
+    // time goes on a real console. Approximate: updated without locking.
+    struct Stats
+    {
+        u32         gameFrames;         ///< Top screen frames the game showed
+        u32         captured;
+        u32         skippedBusy;        ///< Due, but every buffer was still being saved
+        u32         lastBusyFrame;
+        u32         encoded[2];         ///< Per worker
+        u64         encodeTicks[2];
+        u32         tooBig;             ///< JPEG didn't fit the buffer
+        u32         audioTicks;
+        u32         audioMissedTicks;
+        u32         audioLostSamples;
+        const char *audioStatus;
+    };
+
+    static Stats            g_stats;
+
     //--------------------------------------------------------------------------
     // Settings
     //--------------------------------------------------------------------------
@@ -79,7 +98,7 @@ namespace Bingu
         if (file.Read(&loaded, sizeof(loaded)) == File::SUCCESS && loaded.version == version)
         {
             if (loaded.screens <= (u8)CaptureScreens::Both && loaded.fps >= 1 && loaded.fps <= 30
-                && loaded.quality >= 1 && loaded.quality <= 100 && loaded.audio <= 2)
+                && loaded.quality >= 1 && loaded.quality <= 100 && loaded.audio <= 2 && loaded.priority <= 1)
                 *this = loaded;
         }
         file.Close();
@@ -133,11 +152,15 @@ namespace Bingu
     static void     CopyColumns(u16 *dst, u32 dstWidth, const u8 *src, u32 stride, u32 columns, u32 step)
     {
         const u32 rows = 240 / step;
+        u32 column[240 * 4 / sizeof(u32)];
 
-        // Walk the source sequentially (framebuffer reads are the slow part)
         for (u32 x = 0; x < columns; ++x, src += stride * step, ++dst)
         {
-            const u8 *in = src;
+            // The framebuffer is mapped uncached: one bulk copy of the column
+            // is much faster than reading it pixel by pixel
+            std::memcpy(column, src, 240 * Bpp);
+
+            const u8 *in = reinterpret_cast<const u8 *>(column);
             u16 *out = dst;
 
             for (u32 r = 0; r < rows; ++r, in += Bpp * step, out += dstWidth)
@@ -154,11 +177,12 @@ namespace Bingu
         const u8 *src = reinterpret_cast<const u8 *>(screen.address);
         u16 *dst = frame + dstRow * g_width + dstX;
 
-        if (!src || !Process::CheckAddress(screen.address))
+        // CTRPF gives us an uncached alias of the framebuffer in physical
+        // memory (0 if the game's framebuffer couldn't be converted). It is
+        // not part of the game's memory map, so Process::CheckAddress()
+        // would reject it.
+        if (!src)
             return;
-
-        // The GPU writes framebuffers behind the CPU's back: drop stale cache lines
-        svcInvalidateProcessDataCache(CUR_PROCESS_HANDLE, screen.address, screen.stride * screenWidth);
 
         switch (screen.format & 7)
         {
@@ -246,13 +270,21 @@ namespace Bingu
 
                 // Due for a new frame, and the writer has a free buffer?
                 // If not, this frame is skipped and shows up as a repeat.
+                ++g_stats.gameFrames;
+
                 if (frameNo >= g_nextFrame && g_head - g_tail < SlotCount)
                 {
                     CaptureFrame(screen);
                     g_slotFrame[g_head % SlotCount] = frameNo;
                     g_nextFrame = frameNo + 1;
                     ++g_head;
+                    ++g_stats.captured;
                     LightEvent_Signal(&g_wake);
+                }
+                else if (frameNo >= g_nextFrame && frameNo != g_stats.lastBusyFrame)
+                {
+                    ++g_stats.skippedBusy;
+                    g_stats.lastBusyFrame = frameNo;
                 }
 
                 if (g_screens == CaptureScreens::Bottom && Recorder::settings.indicator)
@@ -294,6 +326,18 @@ namespace Bingu
     static bool             g_audioEnabled = false;     ///< Set by Start()
     static ThreadEx        *g_audioThread = nullptr;
 
+    // Process::CheckAddress() only knows the game's regular memory and skips
+    // IO mappings like the DSP's, so ask the kernel directly
+    static bool     IsReadable(u32 address)
+    {
+        MemInfo info;
+        PageInfo page;
+
+        if (R_FAILED(svcQueryMemory(&info, &page, address)))
+            return false;
+        return info.state != MEMSTATE_FREE && (info.perm & MEMPERM_READ);
+    }
+
     // Same rule the DSP uses to pick a region, including counter wraparound
     static u32      NewerRegion(u16 c0, u16 c1)
     {
@@ -313,6 +357,7 @@ namespace Bingu
         {
             // The workers are behind. Remember the gap so the audio stays in sync.
             g_audioLost += count;
+            g_stats.audioLostSamples += count;
             return;
         }
 
@@ -363,7 +408,10 @@ namespace Bingu
             // Ticks that went by while this thread didn't run: fill with
             // silence to keep the timing
             if (delta > 1)
+            {
+                g_stats.audioMissedTicks += delta - 1;
                 PushAudio(nullptr, (delta - 1 < 40 ? delta - 1 : 40) * SamplesPerTick);
+            }
 
             const vu32 *src = reinterpret_cast<const vu32 *>(DspRegions[region] + DspFinalSamples);
             for (u32 i = 0; i < SamplesPerTick; ++i)
@@ -375,6 +423,7 @@ namespace Bingu
                 g_audioStarted = true;
             }
             PushAudio(tick, SamplesPerTick);
+            ++g_stats.audioTicks;
         }
     }
 
@@ -648,7 +697,7 @@ namespace Bingu
     }
 
     // Compresses the next captured frame, if there is one nobody took yet
-    static bool     EncodeNext(JpegEncoder &encoder, int &quality)
+    static bool     EncodeNext(JpegEncoder &encoder, int &quality, u32 worker)
     {
         u32 frame = g_claim;
 
@@ -667,9 +716,16 @@ namespace Bingu
 
             const u16 *pixels = reinterpret_cast<const u16 *>(g_slots[slot] + AviWriter::ChunkHeaderSize);
 
+            u64 start = svcGetSystemTick();
+
             // -1: keep a spare byte for the AVI padding
             g_outSize[slot] = encoder.Encode(pixels, g_width, g_height,
                 g_out[slot] + AviWriter::ChunkHeaderSize, g_outCapacity - AviWriter::ChunkHeaderSize - 1);
+
+            g_stats.encodeTicks[worker] += svcGetSystemTick() - start;
+            ++g_stats.encoded[worker];
+            if (!g_outSize[slot])
+                ++g_stats.tooBig;
         }
         else
             g_outSize[slot] = g_width * g_height * 2;
@@ -706,6 +762,8 @@ namespace Bingu
 
         LightLock_Unlock(&g_writeLock);
     }
+
+    static void     WriteReport(const Session &s, u32 seconds);
 
     // Opens and finishes the files. Done by the first worker only.
     static void     ManageSession(void)
@@ -774,6 +832,9 @@ namespace Bingu
                 noSound ? " - no sound" : ""), Color::White, Color::ForestGreen);
         }
 
+        if (session->started)
+            WriteReport(*session, seconds);
+
         delete session;
         g_session = nullptr;
         g_failed = false;
@@ -782,9 +843,44 @@ namespace Bingu
         LightEvent_Signal(&g_idle);
     }
 
+    static void     WriteReport(const Session &s, u32 seconds)
+    {
+        static const char *screens[] = { "Top", "Bottom", "Both" };
+        const Settings &set = Recorder::settings;
+        const float secs = seconds ? (float)seconds : 1.f;
+        File file;
+
+        if (File::Open(file, s.baseName + ".txt", File::RWC | File::TRUNCATE) != File::SUCCESS)
+            return;
+
+        auto avgMs = [](u32 w) -> float
+        {
+            return g_stats.encoded[w] ? (float)g_stats.encodeTicks[w] * 1000.f / SYSCLOCK_ARM11 / g_stats.encoded[w] : 0.f;
+        };
+
+        file.WriteLine("BinguRecorder report");
+        file.WriteLine(Utils::Format("Settings: screen %s, %s size, %u fps, compression %s, quality %u, sound %s, priority %s",
+            screens[set.screens], set.halfSize ? "half" : "full", set.fps, set.compress ? "on" : "off", set.quality,
+            set.audio == 0 ? "off" : set.audio == 1 ? "on" : "small", set.priority ? "recording" : "game"));
+        file.WriteLine(Utils::Format("Length: %u s, video %ux%u", seconds, g_width, g_height));
+        file.WriteLine(Utils::Format("Game frames shown: %u (%.1f per second)", g_stats.gameFrames, g_stats.gameFrames / secs));
+        file.WriteLine(Utils::Format("Frames captured: %u (%.1f per second), skipped because still saving: %u",
+            g_stats.captured, g_stats.captured / secs, g_stats.skippedBusy));
+        file.WriteLine(Utils::Format("Worker on game core: %u frames, %.1f ms each", g_stats.encoded[0], avgMs(0)));
+        if (g_workerCount > 1)
+            file.WriteLine(Utils::Format("Worker on system core: %u frames, %.1f ms each", g_stats.encoded[1], avgMs(1)));
+        else
+            file.WriteLine("Worker on system core: could not be started");
+        file.WriteLine(Utils::Format("Frames too big to save: %u", g_stats.tooBig));
+        file.WriteLine(Utils::Format("Sound: %s, %u ticks captured (%.0f per second, 204.5 expected), %u missed, %u samples lost",
+            g_stats.audioStatus, g_stats.audioTicks, g_stats.audioTicks / secs, g_stats.audioMissedTicks, g_stats.audioLostSamples));
+        file.Close();
+    }
+
     static void     WorkerMain(void *arg)
     {
-        const bool manager = arg == nullptr;
+        const u32 worker = reinterpret_cast<u32>(arg);
+        const bool manager = worker == 0;
         JpegEncoder encoder;
         int quality = -1;
 
@@ -797,7 +893,7 @@ namespace Bingu
             if (g_state == Idle)
                 continue;
 
-            while (EncodeNext(encoder, quality))
+            while (EncodeNext(encoder, quality, worker))
                 WriteReady();
             WriteReady();
 
@@ -831,6 +927,21 @@ namespace Bingu
             buffers[i] = nullptr;
         }
         return false;
+    }
+
+    // Worker 0 shares the game's core: by default it only uses time the game
+    // leaves free (lowest priority), with "Priority: Recording" it goes ahead
+    // of the game. Worker 1 is on the system core, where the game's main
+    // thread never runs, so it can always have a fairly high priority (still
+    // below the game's sound threads, which run around 0x18-0x20 there).
+    static s32      WorkerPriority(u32 worker, Codec codec, u8 priority)
+    {
+        if (worker == 1)
+            return 0x28;
+        if (priority)
+            return 0x18;
+        // Raw frames only need writing, which mostly waits on the SD card
+        return codec == Codec::Mjpeg ? 0x3F : 0x2E;
     }
 
     static bool     StartWorkers(void)
@@ -928,7 +1039,7 @@ namespace Bingu
         }
 
         // Sound needs the DSP's memory, which games that use sound have mapped
-        bool audio = settings.audio != 0 && Process::CheckAddress(DspRegions[0]) && Process::CheckAddress(DspRegions[1]);
+        bool audio = settings.audio != 0 && IsReadable(DspRegions[0]) && IsReadable(DspRegions[1]);
 
         if (audio && !g_audioRing)
             g_audioRing = static_cast<u32 *>(::operator new(AudioRingSize * sizeof(u32), std::nothrow));
@@ -945,16 +1056,21 @@ namespace Bingu
         }
         audio = audio && g_audioThread;
 
+        g_stats = Stats();
+        g_stats.lastBusyFrame = ~0u;
+        g_stats.audioStatus = !settings.audio ? "off"
+            : audio ? "on"
+            : !IsReadable(DspRegions[0]) ? "not available (sound memory not readable)"
+            : "not available (could not start)";
+
         if (!StartWorkers())
         {
             OSD::Notify("BinguRecorder: could not start the recording threads", Color::White, Color::Red);
             return;
         }
 
-        // Compressing only uses the CPU time the game doesn't need. Raw frames
-        // just need writing, which mostly waits on the SD card.
         for (u32 i = 0; i < g_workerCount; ++i)
-            svcSetThreadPriority(g_workers[i]->GetHandle(), codec == Codec::Mjpeg ? 0x3F : 0x2E);
+            svcSetThreadPriority(g_workers[i]->GetHandle(), WorkerPriority(i, codec, settings.priority));
 
         LightLock_Lock(&g_lock);
 

@@ -9,6 +9,11 @@ trap 'rm -rf "$out"' EXIT
 g++ -std=gnu++11 -O2 -Wall -Wextra -Werror -I../plugin/Includes \
     avi_writer_test.cpp ../plugin/Sources/AviWriter.cpp ../plugin/Sources/JpegEncoder.cpp \
     ../plugin/Sources/ImaAdpcm.cpp -o "$out/avitest"
+g++ -std=gnu++11 -O2 -Wall -Wextra -Werror -I../player/include \
+    player_test.cpp ../player/source/AviReader.cpp ../player/source/FrameBlit.cpp \
+    ../player/source/ImaAdpcmDecoder.cpp -o "$out/playertest"
+
+"$out/playertest" blit
 
 pixel() { # file x y -> "r g b" of frame 0
     ffmpeg -v error -i "$1" -frames:v 1 -vf "format=rgb24,crop=1:1:$2:$3" -f rawvideo -pix_fmt rgb24 - | od -An -tu1 | xargs
@@ -66,6 +71,21 @@ run() { # codec width height finish [audio]
         awk -v p="$psnr" 'BEGIN { exit !(p > 33) }'
     fi
 
+    # The player must read back exactly what was written
+    local pinfo
+    pinfo=$("$out/playertest" info "$avi")
+    echo "player: $pinfo"
+    grep -q "width=$w height=$h codec=$( [[ $codec == mjpeg ]] && echo mjpeg || echo rgb555 ) fps=10.000 frames=130 real=100 last_real_12=9" <<<"$pinfo"
+    if [[ $codec == raw ]]; then
+        "$out/playertest" frame0 "$avi" "$out/frame0.rgb"
+        python3 - "$out/ref.rgb" "$out/frame0.rgb" <<'PY'
+import sys
+a = open(sys.argv[1], 'rb').read(); b = open(sys.argv[2], 'rb').read()
+assert len(a) == len(b), (len(a), len(b))
+assert max(abs(x - y) for x, y in zip(a, b)) <= 1
+PY
+    fi
+
     if [[ $audio != none ]]; then
         local channels=2 rate=32728
         [[ $audio == mono ]] && channels=1 rate=16364
@@ -96,6 +116,24 @@ err = sum((x - y) ** 2 for x, y in zip(r, d)) or 1
 snr = 10 * math.log10(sig / err)
 print('audio snr=%.1f dB' % snr)
 assert snr > 25, snr
+PY
+        grep -q "audio=$rate/$channels/$((512 * channels))/1017" <<<"$pinfo"
+        # The player's ADPCM decoder uses the classic IMA formula; ffmpeg
+        # uses a slightly more precise one, so compare closely, not exactly
+        "$out/playertest" audio "$avi" "$out/player.pcm"
+        python3 - "$out/ref.pcm" "$out/dec.pcm" "$out/player.pcm" <<'PY'
+import math, struct, sys
+def load(p):
+    d = open(p, 'rb').read()
+    return struct.unpack('<%dh' % (len(d) // 2), d)
+ref, ff, ours = load(sys.argv[1]), load(sys.argv[2]), load(sys.argv[3])
+assert len(ours) == len(ff), (len(ours), len(ff))
+def snr(a, b):
+    n = min(len(a), len(b))
+    sig = sum(x * x for x in a[:n]); err = sum((x - y) ** 2 for x, y in zip(a[:n], b[:n])) or 1
+    return 10 * math.log10(sig / err)
+print('player audio: snr vs tone %.1f dB, vs ffmpeg %.1f dB' % (snr(ref, ours), snr(ff, ours)))
+assert snr(ref, ours) > 25 and snr(ff, ours) > 40
 PY
     fi
 }

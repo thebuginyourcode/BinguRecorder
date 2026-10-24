@@ -14,7 +14,7 @@ namespace Bingu
 
     struct Settings
     {
-        u8      version{3};
+        u8      version{4};
         u8      screens{(u8)CaptureScreens::Top};
         u8      fps{10};
         u8      halfSize{0};
@@ -22,6 +22,7 @@ namespace Bingu
         u8      compress{1};    ///< MJPEG instead of raw bitmaps
         u8      quality{70};    ///< JPEG quality, 1 - 100
         u8      audio{1};       ///< 0: off, 1: stereo 32 kHz, 2: small (mono 16 kHz)
+        u8      priority{0};    ///< 0: game runs at full speed, 1: recording comes first
 
         void    Load(void);
         void    Save(void) const;

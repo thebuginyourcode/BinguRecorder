@@ -2,3 +2,7 @@ plugin/release/
 plugin/debug/
 plugin/*.elf
 plugin/*.3gx
+player/build/
+player/*.elf
+player/*.3dsx
+player/*.smdh

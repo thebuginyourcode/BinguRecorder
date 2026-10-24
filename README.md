@@ -60,6 +60,7 @@ press HOME, or you close the lid, the recording is stopped and saved first.
 | Sound | Off, On (stereo), Small (mono) | On |
 | Compression | On (JPEG frames) / Off (raw bitmaps) | On |
 | Quality | Low, Medium, High, Max | Medium |
+| Priority | Game (full speed) / Recording (smoother video) | Game |
 | Screen | Top, Bottom, Both (top above bottom) | Top |
 | Frame rate | 5, 10, 15, 20, 30 screenshots per second | 10 |
 | Size | Full (400×240) or Half (200×120) | Full |
@@ -81,10 +82,20 @@ With compression on, every screenshot is saved as a JPEG inside the AVI
 With the defaults, an hour is roughly 0.55–0.75 GB. Each quality step
 changes the picture's size by roughly a third.
 
-Compressing takes CPU time. BinguRecorder only uses the time the game leaves
-free, so it never slows the game down. It runs on the lowest-priority
-threads, one on each CPU core when the game allows it. If there isn't
-enough spare time, it records fewer frames.
+Compressing takes CPU time. It runs on two threads. One is on the system
+core, where the game's main thread never runs. The other is on the game's
+core at the lowest priority, so it only uses time the game leaves free. With
+the default **Priority: Game**, recording never slows the game down. If
+there isn't enough spare time, it records fewer frames. With
+**Priority: Recording**, the thread on the game's core goes first instead.
+You get more frames, but the game may slow down while you record.
+
+### Report file
+
+Next to every video, BinguRecorder saves a `.txt` file with the same name.
+It shows how many frames the game drew, how many were recorded, how long
+each one took to compress, and whether the sound was captured. If a video
+looks choppy or has no sound, this file shows why.
 
 ### Sound
 
@@ -110,14 +121,40 @@ A few things to know:
 
 The Old 3DS CPU is slow. These settings are a starting point:
 
-- **Top, Full, 10 fps.** This is the default and works in most games.
-- **Top, Half, 20–30 fps.** Smoother motion, lower resolution.
+- **Top, Full, 10 fps.** This is the default.
+- **Top, Half, 20–30 fps.** Smoother motion, lower resolution. Compressing a
+  frame is about 4× less work.
 - **Both, Full, 5 fps** or **Both, Half, 10–15 fps.**
 
 Games that already use all of the CPU leave less time for compression, and
-videos of them will look choppier. Turn compression off (if you have the SD
-space) or use Half size. Any frame the 3DS can't keep up with is stored as
-a repeat of the previous one, so the video still plays at the correct speed.
+videos of them will look choppier. If that happens, try Half size or
+**Priority: Recording**. The report file shows how many frames per second
+were actually recorded. Any frame the 3DS can't keep up with is stored as a
+repeat of the previous one, so the video still plays at the correct speed.
+
+## Watching videos on the 3DS
+
+`dist/BinguPlayer.3dsx` is a video player for your recordings.
+
+1. Copy `BinguPlayer.3dsx` to `sd:/3ds/`.
+2. Open it from the Homebrew Launcher. The bottom screen lists your
+   recordings, newest first.
+3. Press **A** to play.
+
+| Button | Action |
+| --- | --- |
+| A | Play / pause |
+| Left / Right | Back / forward 10 seconds |
+| B | Back to the list |
+| START | Exit (in the list) |
+
+Videos play on the screen they were recorded from: top-screen videos on the
+top screen, bottom-screen videos on the bottom screen, and "Both" videos on
+both screens. Half-size recordings are scaled back up to fill the screen.
+
+**Sound** needs the 3DS sound firmware dump that most homebrew uses. If the
+player says "No sound", run [DSP1](https://github.com/zoogie/DSP1) once. It
+saves the firmware to `sd:/3ds/dspfirm.cdc`.
 
 ## The video files
 
