@@ -3,9 +3,9 @@
 A screen recorder for the Nintendo 3DS, made to run on the **Old 3DS**.
 
 While you play, it takes screenshots of the game several times a second,
-compresses each one as a JPEG, and stitches them into an `.avi` video on your
-SD card. An hour of gameplay fits in well under 1 GB, so it works for long
-let's play sessions.
+compresses each one as a JPEG, records the game's sound, and stitches it all
+into an `.avi` video on your SD card. An hour of gameplay with sound fits in
+well under 1 GB, so it works for long let's play sessions.
 
 ## Why it's a plugin and not a `.3dsx` app
 
@@ -19,7 +19,8 @@ game, the app isn't running anymore. To record a game, BinguRecorder runs
 - A 3DS with custom firmware, running **Luma3DS v13.0 or newer**. Older
   versions don't have the plugin loader built in.
 - An SD card with free space. With the default settings, expect roughly
-  10–15 MB per minute of video. It depends on how busy the game's picture is.
+  9–12 MB per minute of video with sound. It depends on how busy the game's
+  picture is.
 
 ## Installing
 
@@ -56,8 +57,9 @@ press HOME, or you close the lid, the recording is stopped and saved first.
 
 | Setting | Options | Default |
 | --- | --- | --- |
+| Sound | Off, On (stereo), Small (mono) | On |
 | Compression | On (JPEG frames) / Off (raw bitmaps) | On |
-| Quality | Low, Medium, High, Max | High |
+| Quality | Low, Medium, High, Max | Medium |
 | Screen | Top, Bottom, Both (top above bottom) | Top |
 | Frame rate | 5, 10, 15, 20, 30 screenshots per second | 10 |
 | Size | Full (400×240) or Half (200×120) | Full |
@@ -70,18 +72,39 @@ Settings are saved to `sd:/BinguRecorder/settings.bin`.
 With compression on, every screenshot is saved as a JPEG inside the AVI
 ("Motion JPEG"). This makes files about 10× smaller than raw bitmaps.
 
-| | Raw (compression off) | Compressed, High quality |
-| --- | --- | --- |
-| Per minute (top screen, full size, 10 fps) | ~115 MB | ~10–15 MB |
-| 1 hour | ~7 GB | ~0.6–0.9 GB |
+| Per minute (top screen, full size, 10 fps) | Picture | + Sound (On) | + Sound (Small) |
+| --- | --- | --- | --- |
+| Compression off | ~115 MB | +2 MB | +0.5 MB |
+| Compressed, Medium (default) | ~7–10 MB | +2 MB | +0.5 MB |
+| Compressed, High | ~10–15 MB | +2 MB | +0.5 MB |
 
-Lower quality makes files smaller still. Each step down saves roughly a
-third of the size.
+With the defaults, an hour is roughly 0.55–0.75 GB. Each quality step
+changes the picture's size by roughly a third.
 
 Compressing takes CPU time. BinguRecorder only uses the time the game leaves
 free, so it never slows the game down. It runs on the lowest-priority
 threads, one on each CPU core when the game allows it. If there isn't
 enough spare time, it records fewer frames.
+
+### Sound
+
+BinguRecorder records what comes out of the speakers. It reads the final mix
+that the 3DS's sound chip (DSP) places in memory every ~5 ms. The sound is
+compressed with IMA ADPCM, a fast format most players support:
+
+- **On:** stereo at 32,728 Hz, the 3DS's native rate. About 2 MB per minute.
+- **Small:** mono at half that rate. About 0.5 MB per minute. Fine for
+  speech and most music, but you lose the stereo.
+
+Sound is lined up with the first video frame and kept in sync for the whole
+recording. If it ever has to skip, it inserts silence of the same length
+rather than shifting later sound earlier.
+
+A few things to know:
+
+- Your own voice isn't recorded, only the game's sound.
+- If the "Saved" message ends with "no sound", that game didn't give access
+  to the sound chip's memory. The video is still saved.
 
 ### What the Old 3DS can keep up with
 
@@ -146,7 +169,12 @@ checks their output with ffmpeg (needs `g++` and `ffmpeg`).
 - Worker threads take frames from those buffers, compress them, and append
   them to the AVI file in order. If frames were skipped, they write empty
   "repeat" frames to fill the gap.
+- A small high-priority thread checks the DSP's frame counters every 2 ms.
+  When the DSP finishes a tick, the thread copies the 160 new stereo samples
+  into a ring buffer. The workers encode the sound to IMA ADPCM
+  (`plugin/Sources/ImaAdpcm.cpp`) and write it between the video frames.
 - `plugin/Sources/JpegEncoder.cpp` is a small baseline JPEG encoder made for
   the ARM11 CPU. It uses an integer DCT, 4:2:0 chroma and a lookup table for
   brightness.
-- `plugin/Sources/AviWriter.cpp` is a small AVI 1.0 writer (`RIFF`/`hdrl`/`movi`/`idx1`).
+- `plugin/Sources/AviWriter.cpp` is a small AVI 1.0 writer (`RIFF`/`hdrl`/`movi`/`idx1`)
+  with one video and one audio stream.

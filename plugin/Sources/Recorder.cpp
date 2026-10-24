@@ -1,5 +1,6 @@
 #include "Recorder.hpp"
 #include "AviWriter.hpp"
+#include "ImaAdpcm.hpp"
 #include "JpegEncoder.hpp"
 
 #include <CTRPluginFramework.hpp>
@@ -78,7 +79,7 @@ namespace Bingu
         if (file.Read(&loaded, sizeof(loaded)) == File::SUCCESS && loaded.version == version)
         {
             if (loaded.screens <= (u8)CaptureScreens::Both && loaded.fps >= 1 && loaded.fps <= 30
-                && loaded.quality >= 1 && loaded.quality <= 100)
+                && loaded.quality >= 1 && loaded.quality <= 100 && loaded.audio <= 2)
                 *this = loaded;
         }
         file.Close();
@@ -267,6 +268,117 @@ namespace Bingu
     }
 
     //--------------------------------------------------------------------------
+    // Audio capture
+    //
+    // The DSP writes the final mix (what comes out of the speakers) into its
+    // shared memory: 160 stereo samples per audio tick, at 32728 Hz, so about
+    // every 4.9 ms. That memory exists twice, as a double buffer. The copy
+    // with the higher frame counter holds the newest samples until the game
+    // submits the next tick. A small thread checks the counters every 2 ms
+    // and copies each new tick into a ring buffer.
+    //--------------------------------------------------------------------------
+
+    static constexpr u32    DspRegions[2] = { 0x1FF50000, 0x1FF70000 };
+    static constexpr u32    DspFinalSamples = (0x8540 - 0x8000) * 2;   ///< DSP word address -> byte offset
+    static constexpr u32    DspFrameCounter = 0x7FFE;                  ///< Last u16 of each region
+    static constexpr u32    DspSampleRate = 32728;
+    static constexpr u32    SamplesPerTick = 160;
+    static constexpr u32    AudioRingSize = 32768;                     ///< Stereo samples, about 1 s
+
+    static u32             *g_audioRing = nullptr;      ///< Left | Right << 16
+    static std::atomic<u32> g_audioHead{0};             ///< Written by the audio thread
+    static std::atomic<u32> g_audioTail{0};             ///< Written by the worker saving the file
+    static std::atomic<u32> g_audioLost{0};             ///< Samples dropped because the ring was full
+    static std::atomic<bool> g_audioStarted{false};     ///< First tick captured
+    static u64              g_audioStartTick;           ///< When the first tick was captured
+    static bool             g_audioEnabled = false;     ///< Set by Start()
+    static ThreadEx        *g_audioThread = nullptr;
+
+    // Same rule the DSP uses to pick a region, including counter wraparound
+    static u32      NewerRegion(u16 c0, u16 c1)
+    {
+        if (c0 == 0xFFFF && c1 != 0xFFFE)
+            return 1;
+        if (c1 == 0xFFFF && c0 != 0xFFFE)
+            return 0;
+        return c0 > c1 ? 0 : 1;
+    }
+
+    // `samples` null: silence
+    static void     PushAudio(const u32 *samples, u32 count)
+    {
+        u32 head = g_audioHead;
+
+        if (AudioRingSize - (head - g_audioTail) < count)
+        {
+            // The workers are behind. Remember the gap so the audio stays in sync.
+            g_audioLost += count;
+            return;
+        }
+
+        for (u32 i = 0; i < count; ++i)
+            g_audioRing[(head + i) % AudioRingSize] = samples ? samples[i] : 0;
+        g_audioHead = head + count;
+    }
+
+    static void     AudioMain(void *)
+    {
+        bool tracking = false;
+        u16 last = 0;
+        u32 tick[SamplesPerTick];
+
+        while (true)
+        {
+            svcSleepThread(2000000);
+
+            if (g_state != Recording || !g_audioEnabled)
+            {
+                tracking = false;
+                continue;
+            }
+
+            const u16 c0 = *reinterpret_cast<vu16 *>(DspRegions[0] + DspFrameCounter);
+            const u16 c1 = *reinterpret_cast<vu16 *>(DspRegions[1] + DspFrameCounter);
+            const u32 region = NewerRegion(c0, c1);
+            const u16 counter = region ? c1 : c0;
+
+            if (!tracking)
+            {
+                // Start with the next tick
+                tracking = true;
+                last = counter;
+                continue;
+            }
+
+            u16 delta = counter - last;
+
+            if (!delta)
+                continue;
+
+            // libctru skips counter 0 when it wraps around
+            if (counter < last && delta <= 3)
+                delta = 1;
+            last = counter;
+
+            // Ticks that went by while this thread didn't run: fill with
+            // silence to keep the timing
+            if (delta > 1)
+                PushAudio(nullptr, (delta - 1 < 40 ? delta - 1 : 40) * SamplesPerTick);
+
+            const vu32 *src = reinterpret_cast<const vu32 *>(DspRegions[region] + DspFinalSamples);
+            for (u32 i = 0; i < SamplesPerTick; ++i)
+                tick[i] = src[i];
+
+            if (!g_audioStarted)
+            {
+                g_audioStartTick = svcGetSystemTick();
+                g_audioStarted = true;
+            }
+            PushAudio(tick, SamplesPerTick);
+        }
+    }
+
+    //--------------------------------------------------------------------------
     // Encoding and writing (worker threads)
     //
     // Up to two workers run at the lowest priority, one per CPU core, so they
@@ -317,6 +429,146 @@ namespace Bingu
     static Codec            g_codec;
     static int              g_quality;
 
+    //--------------------------------------------------------------------------
+    // Audio output: ring buffer -> IMA ADPCM blocks in the AVI. Only touched
+    // while holding g_writeLock.
+    //--------------------------------------------------------------------------
+
+    static constexpr u32    AudioBlocksPerChunk = 4;    ///< About 0.12 s of audio per write
+    static constexpr u32    AudioSamplesPerBlock = ImaAdpcmEncoder::SamplesPerBlock;
+
+    static AudioFormat      g_audioFormat;
+    static ImaAdpcmEncoder  g_adpcm;
+    static bool             g_audioMono;            ///< "Small": mono at half the sample rate
+    static s16              g_audioPcm[AudioSamplesPerBlock * 2];
+    static u32              g_audioPcmCount;        ///< Samples per channel in g_audioPcm
+    static s32              g_audioDecimate[3];     ///< Mono: sum of L + R and sample count
+    static u8               g_audioChunk[AviWriter::ChunkHeaderSize
+                                         + AudioBlocksPerChunk * ImaAdpcmEncoder::BlockBytesPerChannel * 2 + 1];
+    static u32              g_audioBlocks;          ///< Encoded blocks waiting in g_audioChunk
+    static bool             g_audioSynced;
+    static u32              g_audioSkip;            ///< Captured samples from before the video started
+
+    static void     ResetAudioOutput(u32 mode)
+    {
+        g_audioMono = mode == 2;
+        g_adpcm.Reset(g_audioMono ? 1 : 2);
+        g_audioFormat.sampleRate = g_audioMono ? DspSampleRate / 2 : DspSampleRate;
+        g_audioFormat.channels = g_adpcm.Channels();
+        g_audioFormat.blockAlign = g_adpcm.BlockSize();
+        g_audioFormat.samplesPerBlock = AudioSamplesPerBlock;
+        g_audioPcmCount = 0;
+        g_audioDecimate[0] = g_audioDecimate[1] = g_audioDecimate[2] = 0;
+        g_audioBlocks = 0;
+        g_audioSynced = false;
+        g_audioSkip = 0;
+    }
+
+    static bool     FlushAudioChunk(Session &s)
+    {
+        bool ok = s.avi.WriteAudio(g_audioChunk, g_audioBlocks);
+
+        g_audioBlocks = 0;
+        return ok;
+    }
+
+    static bool     AddAudioSample(Session &s, s32 left, s32 right)
+    {
+        if (g_audioMono)
+        {
+            // Average 2 stereo samples into 1 mono sample (simple low-pass +
+            // half the sample rate)
+            g_audioDecimate[0] += left + right;
+            if (++g_audioDecimate[2] < 2)
+                return true;
+
+            g_audioPcm[g_audioPcmCount] = g_audioDecimate[0] / 4;
+            g_audioDecimate[0] = g_audioDecimate[2] = 0;
+        }
+        else
+        {
+            g_audioPcm[g_audioPcmCount * 2] = left;
+            g_audioPcm[g_audioPcmCount * 2 + 1] = right;
+        }
+
+        if (++g_audioPcmCount < AudioSamplesPerBlock)
+            return true;
+
+        g_adpcm.EncodeBlock(g_audioPcm, g_audioChunk + AviWriter::ChunkHeaderSize + g_audioBlocks * g_adpcm.BlockSize());
+        g_audioPcmCount = 0;
+
+        if (++g_audioBlocks == AudioBlocksPerChunk)
+            return FlushAudioChunk(s);
+        return true;
+    }
+
+    // Moves captured audio into the file. `final`: the recording is ending,
+    // write everything including a last, silence-padded block.
+    static bool     SaveAudio(Session &s, bool final)
+    {
+        if (!g_audioEnabled || !s.started)
+            return true;
+
+        if (!g_audioSynced)
+        {
+            if (!g_audioStarted)
+                return true;
+
+            // Line the audio up with the first video frame: drop samples from
+            // before it, or start with silence if the audio started later.
+            u64 videoStart = g_startTick + (u64)s.firstFrame * SYSCLOCK_ARM11 / g_fps;
+            s64 offset = (s64)(videoStart - g_audioStartTick) * DspSampleRate / (s64)SYSCLOCK_ARM11;
+
+            if (offset > 0)
+                g_audioSkip = (u32)offset;
+            else
+            {
+                for (s64 i = offset < -(s64)DspSampleRate ? -(s64)DspSampleRate : offset; i < 0; ++i)
+                {
+                    if (!AddAudioSample(s, 0, 0))
+                        return false;
+                }
+            }
+            g_audioSynced = true;
+        }
+
+        u32 tail = g_audioTail;
+        const u32 head = g_audioHead;
+
+        for (; tail != head; ++tail)
+        {
+            if (g_audioSkip)
+            {
+                --g_audioSkip;
+                continue;
+            }
+
+            u32 sample = g_audioRing[tail % AudioRingSize];
+            if (!AddAudioSample(s, (s16)(sample & 0xFFFF), (s16)(sample >> 16)))
+            {
+                g_audioTail = tail;
+                return false;
+            }
+        }
+        g_audioTail = tail;
+
+        for (u32 lost = g_audioLost.exchange(0); lost; --lost)
+        {
+            if (!AddAudioSample(s, 0, 0))
+                return false;
+        }
+
+        if (!final)
+            return true;
+
+        while (g_audioPcmCount)
+        {
+            if (!AddAudioSample(s, 0, 0))
+                return false;
+        }
+        return FlushAudioChunk(s);
+    }
+
     static std::string  MakeBaseName(void)
     {
         time_t now = time(nullptr);
@@ -344,7 +596,8 @@ namespace Bingu
             return false;
 
         s.open = true;
-        return s.avi.Begin(&s.sink, g_width, g_height, g_fps, g_codec, g_outCapacity);
+        VideoFormat video = { g_width, g_height, g_fps, g_codec, g_outCapacity };
+        return s.avi.Begin(&s.sink, video, g_audioEnabled ? &g_audioFormat : nullptr);
     }
 
     static bool     ClosePart(Session &s)
@@ -448,6 +701,9 @@ namespace Bingu
             ++g_tail;
         }
 
+        if (g_session && !g_failed && !SaveAudio(*g_session, false))
+            g_failed = true;
+
         LightLock_Unlock(&g_writeLock);
     }
 
@@ -495,6 +751,7 @@ namespace Bingu
             // Pad up to the moment the user pressed stop
             if (g_stopFrame > session->written)
                 ok = session->avi.WriteDropped(g_stopFrame - session->written);
+            ok = ok && SaveAudio(*session, true);
             seconds = ((g_stopFrame > session->written ? g_stopFrame : session->written) - session->firstFrame) / g_fps;
         }
 
@@ -512,7 +769,9 @@ namespace Bingu
         {
             std::string name = PartPath(*session);
             name = name.substr(name.rfind('/') + 1);
-            OSD::Notify(Utils::Format("Saved %s (%u:%02u)", name.c_str(), seconds / 60, seconds % 60), Color::White, Color::ForestGreen);
+            bool noSound = Recorder::settings.audio && !(g_audioEnabled && g_audioStarted);
+            OSD::Notify(Utils::Format("Saved %s (%u:%02u)%s", name.c_str(), seconds / 60, seconds % 60,
+                noSound ? " - no sound" : ""), Color::White, Color::ForestGreen);
         }
 
         delete session;
@@ -668,6 +927,24 @@ namespace Bingu
             return;
         }
 
+        // Sound needs the DSP's memory, which games that use sound have mapped
+        bool audio = settings.audio != 0 && Process::CheckAddress(DspRegions[0]) && Process::CheckAddress(DspRegions[1]);
+
+        if (audio && !g_audioRing)
+            g_audioRing = static_cast<u32 *>(::operator new(AudioRingSize * sizeof(u32), std::nothrow));
+
+        if (audio && !g_audioThread && g_audioRing)
+        {
+            // High priority but it only runs for a few microseconds every 2 ms
+            g_audioThread = new ThreadEx(AudioMain, 0x1000, 0x18, -2);
+            if (R_FAILED(g_audioThread->Start(nullptr)))
+            {
+                delete g_audioThread;
+                g_audioThread = nullptr;
+            }
+        }
+        audio = audio && g_audioThread;
+
         if (!StartWorkers())
         {
             OSD::Notify("BinguRecorder: could not start the recording threads", Color::White, Color::Red);
@@ -688,6 +965,13 @@ namespace Bingu
         g_height = height;
         g_codec = codec;
         g_quality = settings.quality;
+
+        g_audioEnabled = audio;
+        g_audioHead = 0;
+        g_audioTail = 0;
+        g_audioLost = 0;
+        g_audioStarted = false;
+        ResetAudioOutput(settings.audio);
 
         // Black background for the borders around the bottom screen
         for (u32 i = 0; i < SlotCount; ++i)

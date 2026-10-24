@@ -4,29 +4,26 @@
 
 namespace Bingu
 {
-    // Fixed header layout (offsets into the file):
-    //   0   RIFF <size> 'AVI '
-    //   12  LIST <size> 'hdrl'
-    //   24    avih <56>               data @ 32
-    //   88    LIST <size> 'strl'
-    //   100     strh <56>             data @ 108
-    //   164     strf <40>             data @ 172
-    //   212 LIST <size> 'movi'
-    //   224   00db / 00dc chunks...
-    //   ...   idx1
-    static constexpr uint32_t   HeaderSize = 224;
-    static constexpr uint32_t   RiffSizeOffset = 4;
-    static constexpr uint32_t   TotalFramesOffset = 32 + 16;
-    static constexpr uint32_t   StreamLengthOffset = 108 + 32;
-    static constexpr uint32_t   MoviSizeOffset = 216;
-    static constexpr uint32_t   MoviFourccOffset = 220;
+    // File layout:
+    //   RIFF <size> 'AVI '
+    //     LIST <size> 'hdrl'
+    //       avih
+    //       LIST <size> 'strl'   video: strh + strf (BITMAPINFOHEADER)
+    //       LIST <size> 'strl'   audio: strh + strf (WAVEFORMATEX), optional
+    //     LIST <size> 'movi'
+    //       00db / 00dc video chunks, 01wb audio chunks
+    //     idx1
 
-    // Update the header every N frames so a recording interrupted by a crash
+    // Update the header every N chunks so a recording interrupted by a crash
     // or power loss is still readable (players can rebuild the missing index).
     static constexpr uint32_t   PatchInterval = 60;
 
     static constexpr uint32_t   AVIF_HASINDEX = 0x10;
+    static constexpr uint32_t   AVIF_ISINTERLEAVED = 0x100;
     static constexpr uint32_t   AVIIF_KEYFRAME = 0x10;
+    static constexpr uint16_t   WAVE_FORMAT_IMA_ADPCM = 0x11;
+
+    static constexpr uint32_t   MaxHeaderSize = 512;
 
     static void     Put32(uint8_t *p, uint32_t v)
     {
@@ -42,87 +39,152 @@ namespace Bingu
         p[1] = v >> 8;
     }
 
-    static void     PutTag(uint8_t *p, const char *tag)
+    // Little helper to lay out the header
+    struct HeaderBuilder
     {
-        std::memcpy(p, tag, 4);
-    }
+        uint8_t    *base;
+        uint32_t    pos;
 
-    bool    AviWriter::Begin(AviSink *sink, uint32_t width, uint32_t height, uint32_t fps,
-                             Codec codec, uint32_t maxFrameSize)
+        uint32_t    Tag(const char *tag)  { std::memcpy(base + pos, tag, 4); pos += 4; return pos - 4; }
+        uint32_t    U32(uint32_t v)       { Put32(base + pos, v); pos += 4; return pos - 4; }
+        uint32_t    U16(uint16_t v)       { Put16(base + pos, v); pos += 2; return pos - 2; }
+
+        // Starts a LIST or chunk; returns the offset of its size field
+        uint32_t    Begin(const char *tag) { Tag(tag); return U32(0); }
+        void        End(uint32_t sizeOffset) { Put32(base + sizeOffset, pos - sizeOffset - 4); }
+    };
+
+    bool    AviWriter::Begin(AviSink *sink, const VideoFormat &video, const AudioFormat *audio)
     {
-        const bool mjpeg = codec == Codec::Mjpeg;
+        const bool mjpeg = video.codec == Codec::Mjpeg;
 
         _sink = sink;
-        _width = width;
-        _height = height;
-        _fps = fps;
-        std::memcpy(_chunkId, mjpeg ? "00dc" : "00db", 4);
+        _video = video;
+        _hasAudio = audio != nullptr;
+        if (audio)
+            _audio = *audio;
+        std::memcpy(_chunkIds[0], mjpeg ? "00dc" : "00db", 4);
+        std::memcpy(_chunkIds[1], "01wb", 4);
         _position = 0;
-        _framesSincePatch = 0;
+        _frames = 0;
+        _audioBlocks = 0;
+        _chunksSincePatch = 0;
         _index.clear();
         _index.reserve(1024);
 
         // Raw: RGB555, width is always even so rows are 4-byte aligned
-        const uint32_t imageSize = width * height * (mjpeg ? 3 : 2);
-        const uint32_t bufferSize = (mjpeg ? maxFrameSize : imageSize) + ChunkHeaderSize;
+        const uint32_t imageSize = video.width * video.height * (mjpeg ? 3 : 2);
+        const uint32_t bufferSize = (mjpeg ? video.maxFrameSize : imageSize) + ChunkHeaderSize;
+        const uint32_t audioBytesPerSec = _hasAudio ?
+            (uint32_t)((uint64_t)_audio.sampleRate * _audio.blockAlign / _audio.samplesPerBlock) : 0;
 
-        uint8_t h[HeaderSize];
+        uint8_t h[MaxHeaderSize];
         std::memset(h, 0, sizeof(h));
+        HeaderBuilder b{h, 0};
 
-        PutTag(h + 0, "RIFF");
-        PutTag(h + 8, "AVI ");
+        uint32_t riff = b.Begin("RIFF");
+        b.Tag("AVI ");
 
-        PutTag(h + 12, "LIST");
-        Put32(h + 16, 212 - 20);
-        PutTag(h + 20, "hdrl");
+        uint32_t hdrl = b.Begin("LIST");
+        b.Tag("hdrl");
 
-        PutTag(h + 24, "avih");
-        Put32(h + 28, 56);
-        uint8_t *avih = h + 32;
-        Put32(avih + 0, 1000000 / fps);     // dwMicroSecPerFrame
-        Put32(avih + 4, bufferSize * fps);  // dwMaxBytesPerSec
-        Put32(avih + 12, AVIF_HASINDEX);    // dwFlags
-        Put32(avih + 24, 1);                // dwStreams
-        Put32(avih + 28, bufferSize);       // dwSuggestedBufferSize
-        Put32(avih + 32, width);
-        Put32(avih + 36, height);
+        // Main header
+        b.Tag("avih");
+        b.U32(56);
+        b.U32(1000000 / video.fps);                    // dwMicroSecPerFrame
+        b.U32(bufferSize * video.fps + audioBytesPerSec); // dwMaxBytesPerSec
+        b.U32(0);                                       // dwPaddingGranularity
+        b.U32(AVIF_HASINDEX | (_hasAudio ? AVIF_ISINTERLEAVED : 0));
+        _totalFramesOffset = b.U32(0);                  // dwTotalFrames
+        b.U32(0);                                       // dwInitialFrames
+        b.U32(_hasAudio ? 2 : 1);                       // dwStreams
+        b.U32(bufferSize);                              // dwSuggestedBufferSize
+        b.U32(video.width);
+        b.U32(video.height);
+        b.pos += 16;                                    // dwReserved
 
-        PutTag(h + 88, "LIST");
-        Put32(h + 92, 212 - 96);
-        PutTag(h + 96, "strl");
+        // Video stream
+        uint32_t strl = b.Begin("LIST");
+        b.Tag("strl");
+        b.Tag("strh");
+        b.U32(56);
+        b.Tag("vids");
+        b.Tag(mjpeg ? "MJPG" : "DIB ");
+        b.U32(0);                                       // dwFlags
+        b.U32(0);                                       // wPriority, wLanguage
+        b.U32(0);                                       // dwInitialFrames
+        b.U32(1);                                       // dwScale
+        b.U32(video.fps);                               // dwRate
+        b.U32(0);                                       // dwStart
+        _videoLengthOffset = b.U32(0);                  // dwLength
+        b.U32(bufferSize);                              // dwSuggestedBufferSize
+        b.U32(0xFFFFFFFF);                              // dwQuality
+        b.U32(0);                                       // dwSampleSize
+        b.U16(0); b.U16(0);                             // rcFrame
+        b.U16(video.width); b.U16(video.height);
 
-        PutTag(h + 100, "strh");
-        Put32(h + 104, 56);
-        uint8_t *strh = h + 108;
-        PutTag(strh + 0, "vids");
-        PutTag(strh + 4, mjpeg ? "MJPG" : "DIB ");
-        Put32(strh + 20, 1);                // dwScale
-        Put32(strh + 24, fps);              // dwRate
-        Put32(strh + 36, bufferSize);       // dwSuggestedBufferSize
-        Put32(strh + 40, 0xFFFFFFFF);       // dwQuality
-        Put16(strh + 52, (uint16_t)width);  // rcFrame.right
-        Put16(strh + 54, (uint16_t)height); // rcFrame.bottom
-
-        PutTag(h + 164, "strf");
-        Put32(h + 168, 40);
-        uint8_t *bih = h + 172;
-        Put32(bih + 0, 40);                 // biSize
-        Put32(bih + 4, width);
-        Put32(bih + 8, height);             // positive: bottom-up rows
-        Put16(bih + 12, 1);                 // biPlanes
+        b.Tag("strf");
+        b.U32(40);
+        b.U32(40);                                      // biSize
+        b.U32(video.width);
+        b.U32(video.height);                            // positive: bottom-up rows
+        b.U16(1);                                       // biPlanes
         if (mjpeg)
         {
-            Put16(bih + 14, 24);            // biBitCount
-            PutTag(bih + 16, "MJPG");       // biCompression
+            b.U16(24);                                  // biBitCount
+            b.Tag("MJPG");                              // biCompression
         }
         else
-            Put16(bih + 14, 16);            // biBitCount (BI_RGB 16 bit == RGB555)
-        Put32(bih + 20, imageSize);         // biSizeImage
+        {
+            b.U16(16);                                  // BI_RGB 16 bit == RGB555
+            b.U32(0);
+        }
+        b.U32(imageSize);                               // biSizeImage
+        b.pos += 16;                                    // resolution, palette
+        b.End(strl);
 
-        PutTag(h + 212, "LIST");
-        PutTag(h + 220, "movi");
+        // Audio stream (same conventions as ffmpeg uses for ADPCM)
+        if (_hasAudio)
+        {
+            strl = b.Begin("LIST");
+            b.Tag("strl");
+            b.Tag("strh");
+            b.U32(56);
+            b.Tag("auds");
+            b.U32(0);                                   // fccHandler
+            b.U32(0);                                   // dwFlags
+            b.U32(0);                                   // wPriority, wLanguage
+            b.U32(0);                                   // dwInitialFrames
+            b.U32(_audio.samplesPerBlock);              // dwScale
+            b.U32(_audio.sampleRate);                   // dwRate
+            b.U32(0);                                   // dwStart
+            _audioLengthOffset = b.U32(0);              // dwLength (blocks)
+            b.U32(_audio.blockAlign * 8);               // dwSuggestedBufferSize
+            b.U32(0xFFFFFFFF);                          // dwQuality
+            b.U32(_audio.blockAlign);                   // dwSampleSize
+            b.pos += 8;                                 // rcFrame
 
-        if (!Append(h, sizeof(h)))
+            b.Tag("strf");
+            b.U32(20);
+            b.U16(WAVE_FORMAT_IMA_ADPCM);
+            b.U16(_audio.channels);
+            b.U32(_audio.sampleRate);
+            b.U32(audioBytesPerSec);
+            b.U16(_audio.blockAlign);
+            b.U16(4);                                   // wBitsPerSample
+            b.U16(2);                                   // cbSize
+            b.U16(_audio.samplesPerBlock);
+            b.End(strl);
+        }
+
+        b.End(hdrl);
+
+        _moviSizeOffset = b.Begin("LIST");
+        _moviStart = b.Tag("movi");
+        _headerSize = b.pos;
+        (void)riff; // RIFF size is filled in by PatchSizes()
+
+        if (!Append(h, _headerSize))
             return false;
         return PatchSizes();
     }
@@ -135,9 +197,9 @@ namespace Bingu
         return true;
     }
 
-    bool    AviWriter::WriteFrame(uint8_t *chunk, uint32_t size)
+    bool    AviWriter::AddChunk(uint8_t *chunk, uint32_t stream, uint32_t size)
     {
-        std::memcpy(chunk, _chunkId, 4);
+        std::memcpy(chunk, _chunkIds[stream], 4);
         Put32(chunk + 4, size);
 
         // RIFF chunks are padded to an even size
@@ -145,16 +207,31 @@ namespace Bingu
         if (size & 1)
             chunk[ChunkHeaderSize + size] = 0;
 
-        uint32_t offset = _position - MoviFourccOffset;
+        uint32_t offset = _position - _moviStart;
 
         if (!Append(chunk, padded + ChunkHeaderSize))
             return false;
 
-        _index.push_back({offset, size});
+        _index.push_back({offset, size, stream});
 
-        if (++_framesSincePatch >= PatchInterval)
+        if (++_chunksSincePatch >= PatchInterval)
             return PatchSizes();
         return true;
+    }
+
+    bool    AviWriter::WriteFrame(uint8_t *chunk, uint32_t size)
+    {
+        ++_frames;
+        return AddChunk(chunk, 0, size);
+    }
+
+    bool    AviWriter::WriteAudio(uint8_t *chunk, uint32_t blocks)
+    {
+        if (!_hasAudio || !blocks)
+            return true;
+
+        _audioBlocks += blocks;
+        return AddChunk(chunk, 1, blocks * _audio.blockAlign);
     }
 
     bool    AviWriter::WriteDropped(uint32_t count)
@@ -163,58 +240,58 @@ namespace Bingu
 
         for (uint32_t i = 0; i < 16; ++i)
         {
-            std::memcpy(empty + i * ChunkHeaderSize, _chunkId, 4);
+            std::memcpy(empty + i * ChunkHeaderSize, _chunkIds[0], 4);
             Put32(empty + i * ChunkHeaderSize + 4, 0);
         }
 
         while (count)
         {
             uint32_t n = count > 16 ? 16 : count;
-            uint32_t offset = _position - MoviFourccOffset;
+            uint32_t offset = _position - _moviStart;
 
             if (!Append(empty, n * ChunkHeaderSize))
                 return false;
 
             for (uint32_t i = 0; i < n; ++i)
-                _index.push_back({offset + i * ChunkHeaderSize, 0});
+                _index.push_back({offset + i * ChunkHeaderSize, 0, 0});
 
             count -= n;
-            _framesSincePatch += n;
+            _frames += n;
+            _chunksSincePatch += n;
         }
 
-        if (_framesSincePatch >= PatchInterval)
+        if (_chunksSincePatch >= PatchInterval)
             return PatchSizes();
         return true;
     }
 
     uint32_t    AviWriter::ProjectedSize(uint32_t extraFrames, uint32_t frameSize) const
     {
-        uint32_t frames = FrameCount() + extraFrames;
-        return _position + extraFrames * (frameSize + 1 + ChunkHeaderSize) + 8 + frames * 16;
+        uint32_t chunks = (uint32_t)_index.size() + extraFrames;
+        return _position + extraFrames * (frameSize + 1 + ChunkHeaderSize) + 8 + chunks * 16;
+    }
+
+    bool    AviWriter::Patch32(uint32_t offset, uint32_t value)
+    {
+        uint8_t v[4];
+
+        Put32(v, value);
+        return _sink->Seek(offset) && _sink->Write(v, 4);
     }
 
     bool    AviWriter::PatchSizes(void)
     {
-        uint8_t v[4];
-        uint32_t frames = FrameCount();
-        uint32_t end = _position;
+        const uint32_t end = _position;
 
-        _framesSincePatch = 0;
+        _chunksSincePatch = 0;
 
-        Put32(v, end - 8);
-        if (!_sink->Seek(RiffSizeOffset) || !_sink->Write(v, 4))
-            return false;
-
-        Put32(v, frames);
-        if (!_sink->Seek(TotalFramesOffset) || !_sink->Write(v, 4))
-            return false;
-        if (!_sink->Seek(StreamLengthOffset) || !_sink->Write(v, 4))
-            return false;
-
-        // While recording the movi list runs to the end of the file. Once
+        // While recording, the movi list runs to the end of the file. Once
         // idx1 is appended Finish() fixes this up to stop before it.
-        Put32(v, (end > HeaderSize ? end : HeaderSize) - MoviFourccOffset);
-        if (!_sink->Seek(MoviSizeOffset) || !_sink->Write(v, 4))
+        if (!Patch32(4, end - 8)
+            || !Patch32(_totalFramesOffset, _frames)
+            || !Patch32(_videoLengthOffset, _frames)
+            || (_hasAudio && !Patch32(_audioLengthOffset, _audioBlocks))
+            || !Patch32(_moviSizeOffset, end - _moviSizeOffset - 4))
             return false;
 
         return _sink->Seek(end);
@@ -225,14 +302,14 @@ namespace Bingu
         if (!_sink)
             return false;
 
-        uint32_t moviEnd = _position;
+        const uint32_t moviEnd = _position;
 
         // Write the index in blocks to keep the number of SD writes low
         uint8_t block[16 * 64];
         uint8_t header[8];
 
-        PutTag(header, "idx1");
-        Put32(header + 4, FrameCount() * 16);
+        std::memcpy(header, "idx1", 4);
+        Put32(header + 4, (uint32_t)_index.size() * 16);
         if (!Append(header, 8))
             return false;
 
@@ -241,7 +318,7 @@ namespace Bingu
         {
             uint8_t *p = block + used;
 
-            std::memcpy(p, _chunkId, 4);
+            std::memcpy(p, _chunkIds[e.stream], 4);
             Put32(p + 4, e.size ? AVIIF_KEYFRAME : 0);
             Put32(p + 8, e.offset);
             Put32(p + 12, e.size);
@@ -258,12 +335,7 @@ namespace Bingu
         if (used && !Append(block, used))
             return false;
 
-        if (!PatchSizes())
-            return false;
-
-        uint8_t v[4];
-        Put32(v, moviEnd - MoviFourccOffset);
-        if (!_sink->Seek(MoviSizeOffset) || !_sink->Write(v, 4))
+        if (!PatchSizes() || !Patch32(_moviSizeOffset, moviEnd - _moviSizeOffset - 4))
             return false;
 
         _sink = nullptr;

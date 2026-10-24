@@ -1,8 +1,10 @@
 // Host-side test for the AVI writer and JPEG encoder: builds a short clip with
 // real and dropped frames, then (via run_tests.sh) checks it with ffmpeg.
 //
-// usage: avitest <out.avi> <finish 0|1> <raw|mjpeg> <width> <height> [ref.rgb]
+// usage: avitest <out.avi> <finish 0|1> <raw|mjpeg> <width> <height> <none|stereo|mono>
+//                [ref.rgb] [ref.pcm]
 #include "AviWriter.hpp"
+#include "ImaAdpcm.hpp"
 #include "JpegEncoder.hpp"
 
 #include <cmath>
@@ -50,9 +52,16 @@ static void DrawFrame(uint16_t *px, uint32_t w, uint32_t h, uint32_t frame)
     }
 }
 
+// Test tone: 440 Hz left, 660 Hz right (the same tone on both for mono)
+static int16_t Tone(uint64_t n, uint32_t rate, uint32_t channel)
+{
+    double f = channel ? 660.0 : 440.0;
+    return (int16_t)(12000 * sin(2 * M_PI * f * n / rate));
+}
+
 int main(int argc, char **argv)
 {
-    if (argc < 6)
+    if (argc < 7)
         return 1;
 
     FILE *f = fopen(argv[1], "wb");
@@ -62,6 +71,9 @@ int main(int argc, char **argv)
     bool finish = atoi(argv[2]) != 0;   // 0 simulates a recording that was cut off (no idx1)
     bool mjpeg = strcmp(argv[3], "mjpeg") == 0;
     uint32_t w = atoi(argv[4]), h = atoi(argv[5]);
+    bool audio = strcmp(argv[6], "none") != 0;
+    uint32_t channels = strcmp(argv[6], "mono") == 0 ? 1 : 2;
+    uint32_t rate = channels == 1 ? 16364 : 32728;
 
     FileSink sink(f);
     Bingu::AviWriter avi;
@@ -69,8 +81,19 @@ int main(int argc, char **argv)
     const uint32_t rawSize = w * h * 2;
     const uint32_t outSize = Bingu::AviWriter::ChunkHeaderSize + w * h + 1;
 
-    if (!avi.Begin(&sink, w, h, 10, mjpeg ? Bingu::Codec::Mjpeg : Bingu::Codec::Raw, outSize))
+    Bingu::ImaAdpcmEncoder adpcm(channels);
+    Bingu::AudioFormat af = { rate, (uint16_t)channels, (uint16_t)adpcm.BlockSize(),
+                              (uint16_t)Bingu::ImaAdpcmEncoder::SamplesPerBlock };
+    Bingu::VideoFormat vf = { w, h, 10, mjpeg ? Bingu::Codec::Mjpeg : Bingu::Codec::Raw, outSize };
+
+    if (!avi.Begin(&sink, vf, audio ? &af : nullptr))
         return 2;
+
+    const uint32_t spb = Bingu::ImaAdpcmEncoder::SamplesPerBlock;
+    std::vector<int16_t> pcm(spb * channels);
+    std::vector<uint8_t> audioChunk(Bingu::AviWriter::ChunkHeaderSize + adpcm.BlockSize() + 1);
+    uint64_t samplesWritten = 0;
+    FILE *refPcm = audio && argc > 8 ? fopen(argv[8], "wb") : nullptr;
 
     std::vector<uint8_t> chunk(Bingu::AviWriter::ChunkHeaderSize + rawSize + 1);
     std::vector<uint8_t> out(outSize);
@@ -81,10 +104,10 @@ int main(int argc, char **argv)
     {
         DrawFrame(px, w, h, frame);
 
-        if (frame == 0 && argc > 6)
+        if (frame == 0 && argc > 7)
         {
             // Reference picture for the quality check (top-down RGB24)
-            FILE *ref = fopen(argv[6], "wb");
+            FILE *ref = fopen(argv[7], "wb");
             for (uint32_t ty = 0; ty < h; ++ty)
                 for (uint32_t x = 0; x < w; ++x)
                 {
@@ -112,7 +135,26 @@ int main(int argc, char **argv)
 
         if (frame % 10 == 9 && !avi.WriteDropped(3))
             return 4;
+
+        // Audio up to the end of the frames written so far, interleaved
+        // the way the recorder does it
+        uint64_t due = (uint64_t)avi.FrameCount() * rate / 10;
+        while (audio && samplesWritten + spb <= due)
+        {
+            for (uint32_t i = 0; i < spb; ++i)
+                for (uint32_t c = 0; c < channels; ++c)
+                    pcm[i * channels + c] = Tone(samplesWritten + i, rate, c);
+            if (refPcm)
+                fwrite(pcm.data(), 2, pcm.size(), refPcm);
+
+            adpcm.EncodeBlock(pcm.data(), audioChunk.data() + Bingu::AviWriter::ChunkHeaderSize);
+            if (!avi.WriteAudio(audioChunk.data(), 1))
+                return 6;
+            samplesWritten += spb;
+        }
     }
+    if (refPcm)
+        fclose(refPcm);
 
     printf("frames=%u avg_frame_bytes=%llu\n", avi.FrameCount(), (unsigned long long)(bytes / 100));
     if (finish && !avi.Finish())

@@ -19,6 +19,14 @@ namespace CTRPluginFramework
     static MenuEntry   *g_indicatorEntry;
     static MenuEntry   *g_compressEntry;
     static MenuEntry   *g_qualityEntry;
+    static MenuEntry   *g_soundEntry;
+
+    static const std::vector<std::string>   SoundNames =
+    {
+        "Off",
+        "On (stereo, ~2 MB/min)",
+        "Small (mono, ~0.5 MB/min)",
+    };
 
     struct QualityChoice
     {
@@ -51,6 +59,7 @@ namespace CTRPluginFramework
         g_indicatorEntry->Name() = s.indicator ? "REC indicator: On" : "REC indicator: Off";
         g_compressEntry->Name() = s.compress ? "Compression: On (small files)" : "Compression: Off (huge files)";
         g_qualityEntry->Name() = "Quality: " + QualityName(s.quality);
+        g_soundEntry->Name() = "Sound: " + SoundNames[s.audio];
     }
 
     static bool     ChangeSetting(void)
@@ -177,6 +186,21 @@ namespace CTRPluginFramework
         }
     }
 
+    static void     ChooseSound(MenuEntry *)
+    {
+        if (!ChangeSetting())
+            return;
+
+        Keyboard kb("Record the game's sound?\n\nSound is compressed (IMA ADPCM) to keep\nfiles small.", SoundNames);
+        int choice = kb.Open();
+
+        if (choice >= 0)
+        {
+            Recorder::settings.audio = (u8)choice;
+            SettingsChanged();
+        }
+    }
+
     static void     ToggleIndicator(MenuEntry *)
     {
         Recorder::settings.indicator ^= 1;
@@ -214,6 +238,8 @@ namespace CTRPluginFramework
         g_indicatorEntry = new MenuEntry("", nullptr, ToggleIndicator, "Shows a blinking REC timer on the screen that is NOT being recorded.");
         g_compressEntry = new MenuEntry("", nullptr, ToggleCompression, "Saves every frame as a JPEG inside the video: about 10x smaller files. Compressing only uses CPU time the game leaves free.");
         g_qualityEntry = new MenuEntry("", nullptr, ChooseQuality, "Image quality of the compressed frames.");
+        g_soundEntry = new MenuEntry("", nullptr, ChooseSound, "Records what comes out of the speakers. Small saves mono sound at half the sample rate.");
+        *folder += g_soundEntry;
         *folder += g_compressEntry;
         *folder += g_qualityEntry;
         *folder += g_screenEntry;

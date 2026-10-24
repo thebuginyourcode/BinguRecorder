@@ -14,13 +14,14 @@ namespace Bingu
 
     struct Settings
     {
-        u8      version{2};
+        u8      version{3};
         u8      screens{(u8)CaptureScreens::Top};
         u8      fps{10};
         u8      halfSize{0};
         u8      indicator{1};
         u8      compress{1};    ///< MJPEG instead of raw bitmaps
-        u8      quality{85};    ///< JPEG quality, 1 - 100
+        u8      quality{70};    ///< JPEG quality, 1 - 100
+        u8      audio{1};       ///< 0: off, 1: stereo 32 kHz, 2: small (mono 16 kHz)
 
         void    Load(void);
         void    Save(void) const;
