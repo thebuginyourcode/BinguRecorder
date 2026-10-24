@@ -6,3 +6,7 @@ player/build/
 player/*.elf
 player/*.3dsx
 player/*.smdh
+tests/emulator/testapp/build/
+tests/emulator/testapp/*.elf
+tests/emulator/testapp/*.smdh
+tests/emulator/testapp/*.cxi
