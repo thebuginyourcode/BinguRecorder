@@ -17,6 +17,29 @@ namespace CTRPluginFramework
     static MenuEntry   *g_fpsEntry;
     static MenuEntry   *g_sizeEntry;
     static MenuEntry   *g_indicatorEntry;
+    static MenuEntry   *g_compressEntry;
+    static MenuEntry   *g_qualityEntry;
+
+    struct QualityChoice
+    {
+        const char *name;
+        u8          value;
+    };
+
+    static const QualityChoice  QualityChoices[] =
+    {
+        { "Low", 50 }, { "Medium", 70 }, { "High", 85 }, { "Max", 95 },
+    };
+
+    static std::string  QualityName(u8 value)
+    {
+        for (const QualityChoice &q : QualityChoices)
+        {
+            if (q.value == value)
+                return q.name;
+        }
+        return Utils::Format("%u", value);
+    }
 
     static void     RefreshNames(void)
     {
@@ -26,6 +49,8 @@ namespace CTRPluginFramework
         g_fpsEntry->Name() = Utils::Format("Frame rate: %u fps", s.fps);
         g_sizeEntry->Name() = s.halfSize ? "Size: Half (smaller, faster)" : "Size: Full";
         g_indicatorEntry->Name() = s.indicator ? "REC indicator: On" : "REC indicator: Off";
+        g_compressEntry->Name() = s.compress ? "Compression: On (small files)" : "Compression: Off (huge files)";
+        g_qualityEntry->Name() = "Quality: " + QualityName(s.quality);
     }
 
     static bool     ChangeSetting(void)
@@ -89,7 +114,7 @@ namespace CTRPluginFramework
         for (u8 fps : FpsChoices)
             names.push_back(Utils::Format("%u fps", fps));
 
-        Keyboard kb("Screenshots per second.\n\nOld 3DS: 10 fps (Full) or 20 fps (Half)\nis usually the most it can keep up with.", names);
+        Keyboard kb("Screenshots per second.\n\nOn an Old 3DS, about 10 fps (Full) or\n20-30 fps (Half) is usually the most it\ncan keep up with. Frames it can't keep up\nwith are skipped, the game never slows down.", names);
         int choice = kb.Open();
 
         if (choice >= 0)
@@ -110,6 +135,44 @@ namespace CTRPluginFramework
         if (choice >= 0)
         {
             Recorder::settings.halfSize = (u8)choice;
+            SettingsChanged();
+        }
+    }
+
+    static void     ToggleCompression(MenuEntry *)
+    {
+        if (!ChangeSetting())
+            return;
+
+        Keyboard kb("Compression",
+        {
+            "On: JPEG frames (~10x smaller files)",
+            "Off: raw bitmaps (lossless, ~115 MB/min)",
+        });
+        int choice = kb.Open();
+
+        if (choice >= 0)
+        {
+            Recorder::settings.compress = choice == 0;
+            SettingsChanged();
+        }
+    }
+
+    static void     ChooseQuality(MenuEntry *)
+    {
+        if (!ChangeSetting())
+            return;
+
+        std::vector<std::string> names;
+        for (const QualityChoice &q : QualityChoices)
+            names.push_back(q.name);
+
+        Keyboard kb("JPEG quality (when compression is on).\nHigher looks better but makes bigger files.", names);
+        int choice = kb.Open();
+
+        if (choice >= 0)
+        {
+            Recorder::settings.quality = QualityChoices[choice].value;
             SettingsChanged();
         }
     }
@@ -149,6 +212,10 @@ namespace CTRPluginFramework
         g_fpsEntry = new MenuEntry("", nullptr, ChooseFps, "How many screenshots are taken per second.");
         g_sizeEntry = new MenuEntry("", nullptr, ChooseSize, "Half size uses 4x less data, so the Old 3DS can record at a higher frame rate.");
         g_indicatorEntry = new MenuEntry("", nullptr, ToggleIndicator, "Shows a blinking REC timer on the screen that is NOT being recorded.");
+        g_compressEntry = new MenuEntry("", nullptr, ToggleCompression, "Saves every frame as a JPEG inside the video: about 10x smaller files. Compressing only uses CPU time the game leaves free.");
+        g_qualityEntry = new MenuEntry("", nullptr, ChooseQuality, "Image quality of the compressed frames.");
+        *folder += g_compressEntry;
+        *folder += g_qualityEntry;
         *folder += g_screenEntry;
         *folder += g_fpsEntry;
         *folder += g_sizeEntry;

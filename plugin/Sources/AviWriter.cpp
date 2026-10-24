@@ -12,7 +12,7 @@ namespace Bingu
     //   100     strh <56>             data @ 108
     //   164     strf <40>             data @ 172
     //   212 LIST <size> 'movi'
-    //   224   00db chunks...
+    //   224   00db / 00dc chunks...
     //   ...   idx1
     static constexpr uint32_t   HeaderSize = 224;
     static constexpr uint32_t   RiffSizeOffset = 4;
@@ -47,17 +47,24 @@ namespace Bingu
         std::memcpy(p, tag, 4);
     }
 
-    bool    AviWriter::Begin(AviSink *sink, uint32_t width, uint32_t height, uint32_t fps)
+    bool    AviWriter::Begin(AviSink *sink, uint32_t width, uint32_t height, uint32_t fps,
+                             Codec codec, uint32_t maxFrameSize)
     {
+        const bool mjpeg = codec == Codec::Mjpeg;
+
         _sink = sink;
         _width = width;
         _height = height;
         _fps = fps;
-        _frameSize = width * height * 2; // RGB555, width is always even so rows are 4-byte aligned
+        std::memcpy(_chunkId, mjpeg ? "00dc" : "00db", 4);
         _position = 0;
         _framesSincePatch = 0;
         _index.clear();
         _index.reserve(1024);
+
+        // Raw: RGB555, width is always even so rows are 4-byte aligned
+        const uint32_t imageSize = width * height * (mjpeg ? 3 : 2);
+        const uint32_t bufferSize = (mjpeg ? maxFrameSize : imageSize) + ChunkHeaderSize;
 
         uint8_t h[HeaderSize];
         std::memset(h, 0, sizeof(h));
@@ -73,10 +80,10 @@ namespace Bingu
         Put32(h + 28, 56);
         uint8_t *avih = h + 32;
         Put32(avih + 0, 1000000 / fps);     // dwMicroSecPerFrame
-        Put32(avih + 4, _frameSize * fps);  // dwMaxBytesPerSec
+        Put32(avih + 4, bufferSize * fps);  // dwMaxBytesPerSec
         Put32(avih + 12, AVIF_HASINDEX);    // dwFlags
         Put32(avih + 24, 1);                // dwStreams
-        Put32(avih + 28, _frameSize + ChunkHeaderSize); // dwSuggestedBufferSize
+        Put32(avih + 28, bufferSize);       // dwSuggestedBufferSize
         Put32(avih + 32, width);
         Put32(avih + 36, height);
 
@@ -88,10 +95,10 @@ namespace Bingu
         Put32(h + 104, 56);
         uint8_t *strh = h + 108;
         PutTag(strh + 0, "vids");
-        PutTag(strh + 4, "DIB ");
+        PutTag(strh + 4, mjpeg ? "MJPG" : "DIB ");
         Put32(strh + 20, 1);                // dwScale
         Put32(strh + 24, fps);              // dwRate
-        Put32(strh + 36, _frameSize + ChunkHeaderSize); // dwSuggestedBufferSize
+        Put32(strh + 36, bufferSize);       // dwSuggestedBufferSize
         Put32(strh + 40, 0xFFFFFFFF);       // dwQuality
         Put16(strh + 52, (uint16_t)width);  // rcFrame.right
         Put16(strh + 54, (uint16_t)height); // rcFrame.bottom
@@ -103,8 +110,14 @@ namespace Bingu
         Put32(bih + 4, width);
         Put32(bih + 8, height);             // positive: bottom-up rows
         Put16(bih + 12, 1);                 // biPlanes
-        Put16(bih + 14, 16);                // biBitCount (BI_RGB 16 bit == RGB555)
-        Put32(bih + 20, _frameSize);        // biSizeImage
+        if (mjpeg)
+        {
+            Put16(bih + 14, 24);            // biBitCount
+            PutTag(bih + 16, "MJPG");       // biCompression
+        }
+        else
+            Put16(bih + 14, 16);            // biBitCount (BI_RGB 16 bit == RGB555)
+        Put32(bih + 20, imageSize);         // biSizeImage
 
         PutTag(h + 212, "LIST");
         PutTag(h + 220, "movi");
@@ -122,17 +135,22 @@ namespace Bingu
         return true;
     }
 
-    bool    AviWriter::WriteFrame(uint8_t *chunk)
+    bool    AviWriter::WriteFrame(uint8_t *chunk, uint32_t size)
     {
-        PutTag(chunk, "00db");
-        Put32(chunk + 4, _frameSize);
+        std::memcpy(chunk, _chunkId, 4);
+        Put32(chunk + 4, size);
+
+        // RIFF chunks are padded to an even size
+        uint32_t padded = size + (size & 1);
+        if (size & 1)
+            chunk[ChunkHeaderSize + size] = 0;
 
         uint32_t offset = _position - MoviFourccOffset;
 
-        if (!Append(chunk, _frameSize + ChunkHeaderSize))
+        if (!Append(chunk, padded + ChunkHeaderSize))
             return false;
 
-        _index.push_back({offset, _frameSize});
+        _index.push_back({offset, size});
 
         if (++_framesSincePatch >= PatchInterval)
             return PatchSizes();
@@ -145,7 +163,7 @@ namespace Bingu
 
         for (uint32_t i = 0; i < 16; ++i)
         {
-            PutTag(empty + i * ChunkHeaderSize, "00db");
+            std::memcpy(empty + i * ChunkHeaderSize, _chunkId, 4);
             Put32(empty + i * ChunkHeaderSize + 4, 0);
         }
 
@@ -169,10 +187,10 @@ namespace Bingu
         return true;
     }
 
-    uint32_t    AviWriter::ProjectedSize(uint32_t extraFrames) const
+    uint32_t    AviWriter::ProjectedSize(uint32_t extraFrames, uint32_t frameSize) const
     {
         uint32_t frames = FrameCount() + extraFrames;
-        return _position + extraFrames * (_frameSize + ChunkHeaderSize) + 8 + frames * 16;
+        return _position + extraFrames * (frameSize + 1 + ChunkHeaderSize) + 8 + frames * 16;
     }
 
     bool    AviWriter::PatchSizes(void)
@@ -223,7 +241,7 @@ namespace Bingu
         {
             uint8_t *p = block + used;
 
-            PutTag(p, "00db");
+            std::memcpy(p, _chunkId, 4);
             Put32(p + 4, e.size ? AVIIF_KEYFRAME : 0);
             Put32(p + 8, e.offset);
             Put32(p + 12, e.size);
