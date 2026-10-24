@@ -231,6 +231,12 @@ namespace CTRPluginFramework
     void    PatchProcess(FwkSettings &settings)
     {
         settings.WaitTimeToBoot = Seconds(3);
+
+        // CTRPF never sets these, so they hold whatever was in memory. With
+        // UseGameHidMemory set by chance, CTRPF aborts in games where it
+        // can't find the svcMapMemoryBlock call it needs for that.
+        settings.UseGameHidMemory = false;
+        settings.CachedDrawMode = false;
     }
 
     int     main(void)

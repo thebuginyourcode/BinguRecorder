@@ -18,6 +18,7 @@
 #define WAVE_COUNT 4
 
 u32 NnStylePresent(u32 isBottom, int bank, void *leftFb, void *rightFb, int stride, int format, int swap);
+Result NnStyleRegisterInterruptRelayQueue(Handle *session, Handle event, u32 flags, Handle *outSharedMem, u32 *outThreadId);
 
 u32 PresentImpl(u32 isBottom, int bank, void *leftFb, void *rightFb, int stride, int format, int swap)
 {
@@ -75,6 +76,14 @@ static void DrawBottom(u8 *fb, u32 n)
 int main(void)
 {
     gfxInitDefault();
+
+    // Games register for GPU interrupts through Nintendo's library code,
+    // which CTRPF hooks. Do the same on a second GSP session.
+    Handle gspSession = 0, gspEvent = 0, gspSharedMem = 0;
+    u32 gspThreadId = 0;
+    if (R_SUCCEEDED(srvGetServiceHandle(&gspSession, "gsp::Gpu"))
+        && R_SUCCEEDED(svcCreateEvent(&gspEvent, RESET_ONESHOT)))
+        NnStyleRegisterInterruptRelayQueue(&gspSession, gspEvent, 1, &gspSharedMem, &gspThreadId);
 
     // Own framebuffers, presented through NnStylePresent
     u8 *top[2], *bottom[2];

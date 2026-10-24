@@ -26,6 +26,22 @@ install -m755 "$work/3gxtool/build/3gxtool" "$DEVKITPRO/tools/bin/3gxtool"
 fetch https://gitlab.com/thepixellizeross/ctrpluginframework.git "$CTRPF_REV" "$work/ctrpf"
 # Newer compilers warn about code in the framework; don't fail on that.
 sed -i 's/-Wall -Werror/-Wall/' "$work/ctrpf/Library/Makefile"
+# Bug fix: the svcMapMemoryBlock hook search restarts after each match but
+# keeps searching the full code size, reading past the end of the game's
+# code (a crash when several svc 0x1F instructions come first).
+python3 - "$work/ctrpf/Library/source/pluginInit.cpp" <<'PY'
+import sys
+path = sys.argv[1]
+src = open(path).read()
+old = "Utils::Search<u32>(svcMapMemoryBlockAddr + 4, Process::GetTextSize(), {0xEF00001F})"
+# Remaining whole words up to the end of the code (never negative, and a
+# multiple of 4: Search() misbehaves when the size is smaller than the pattern)
+new = ("Utils::Search<u32>(svcMapMemoryBlockAddr + 4, [&]() -> u32 { "
+       "const u32 s = svcMapMemoryBlockAddr + 4, e = (0x00100000 + Process::GetTextSize()) & ~3u; "
+       "return e > s ? e - s : 0u; }(), {0xEF00001F})")
+assert src.count(old) == 1, "CTRPF changed, check the svcMapMemoryBlock search patch"
+open(path, 'w').write(src.replace(old, new))
+PY
 # The release and debug libraries share a temporary file, so building them
 # at the same time (make -j) can fail. Build them one after the other.
 make -C "$work/ctrpf/Library" -j"$(nproc)" lib/libctrpf.a >/dev/null

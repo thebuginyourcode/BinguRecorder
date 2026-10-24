@@ -25,7 +25,7 @@ ARCH	:=	-march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
 
 CFLAGS	:=	-mword-relocations \
  			-ffunction-sections -fdata-sections -fno-strict-aliasing \
-			$(ARCH) $(BUILD_FLAGS) $(G)
+			$(ARCH) $(BUILD_CFLAGS) $(G)
 
 CFLAGS		+=	$(INCLUDE) -D__3DS__ $(DEFINES)
 
