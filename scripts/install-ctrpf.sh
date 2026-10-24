@@ -26,7 +26,11 @@ install -m755 "$work/3gxtool/build/3gxtool" "$DEVKITPRO/tools/bin/3gxtool"
 fetch https://gitlab.com/thepixellizeross/ctrpluginframework.git "$CTRPF_REV" "$work/ctrpf"
 # Newer compilers warn about code in the framework; don't fail on that.
 sed -i 's/-Wall -Werror/-Wall/' "$work/ctrpf/Library/Makefile"
-make -C "$work/ctrpf/Library" -j"$(nproc)" install >/dev/null
+# The release and debug libraries share a temporary file, so building them
+# at the same time (make -j) can fail. Build them one after the other.
+make -C "$work/ctrpf/Library" -j"$(nproc)" lib/libctrpf.a >/dev/null
+make -C "$work/ctrpf/Library" -j"$(nproc)" lib/libctrpfd.a >/dev/null
+make -C "$work/ctrpf/Library" install >/dev/null
 # The install step only ships part of the headers the public ones include.
 cp -r "$work/ctrpf/Library/include/." "$DEVKITPRO/libctrpf/include/"
 
